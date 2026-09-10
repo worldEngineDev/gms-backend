@@ -67,10 +67,16 @@ function init(httpServer, redisModule, deps = {}) {
   // {type:'auth', token} message as fallback.
   if (deps && deps.validateToken) _validateToken = deps.validateToken;
   wss = new WebSocketServer({
-    server: httpServer,
-    path: '/ws',
+    noServer: true,
     maxPayload: 256 * 1024,
     perMessageDeflate: false,       // 实时消息小, 关闭压缩降低延迟
+  });
+  // 手动分发升级请求：只接管 /ws，其他路径（如 /api/edge/ws）留给各自的 WSS
+  httpServer.on('upgrade', (req, socket, head) => {
+    let pathname = '';
+    try { pathname = new URL(req.url, 'http://localhost').pathname; } catch { }
+    if (pathname !== '/ws') return;
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   });
 
   wss.on('connection', (ws, req) => {

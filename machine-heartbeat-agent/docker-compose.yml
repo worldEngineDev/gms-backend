@@ -1,5 +1,6 @@
 services:
   heartbeat-agent:
+    image: gms-heartbeat-agent:latest
     build: .
     container_name: gms-heartbeat-agent
     restart: unless-stopped
@@ -18,11 +19,20 @@ services:
       - IMPORTER_API_URL=${IMPORTER_API_URL:-http://127.0.0.1:5025}
       - HERMES_API_URL=${HERMES_API_URL:-http://127.0.0.1:5006}
       - COLLECTOR_API_TIMEOUT=${COLLECTOR_API_TIMEOUT:-3000}
+      - CAMERA_FPS_INTERVAL=${CAMERA_FPS_INTERVAL:-5000}
+      - CAMERA_EXPECTED_FPS=${CAMERA_EXPECTED_FPS:-30}
+      - CAMERA_FPS_THRESHOLD=${CAMERA_FPS_THRESHOLD:-0.8}
+      - CAMERA_SAMPLE_FRAMES=${CAMERA_SAMPLE_FRAMES:-30}
     volumes:
       # SN 识别方式1：WUJI 标定目录（只读）
       - /var/.rdc2:/var/.rdc2:ro
       # SN 识别方式2：读取采集器容器 importer-staging 的 /exchange/machine.jsonc
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 直接采样 V4L2 摄像头帧率
+      - /dev:/dev
+      # Quest ADB 授权密钥持久化（头显上授权一次后，重建容器不丢失）
+      - agent-adb-keys:/root/.android
+    privileged: true
     # Quest 走 ADB over network（TCP 5555）无需透传 USB；若用 USB 调试再放开：
     # devices:
     #   - /dev/bus/usb:/dev/bus/usb
@@ -40,3 +50,6 @@ services:
         reservations:
           cpus: '0.05'
           memory: 48M
+
+volumes:
+  agent-adb-keys: {}

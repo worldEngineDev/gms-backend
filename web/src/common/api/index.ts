@@ -58,6 +58,39 @@ export const getProductionHistory = (machineNumber?: string) =>
 export const getMachineInfo = (machineNumber: string, opts?: { refresh?: boolean }) =>
   get<any>(`/api/machines/${encodeURIComponent(machineNumber)}/info${opts?.refresh ? '?refresh=1' : ''}`, 12000);
 
+// 机器实时流（SSE over fetch）：弹窗打开期间订阅，服务端每 ~2s 直连采集器推送
+export async function streamMachineLive(
+  machineNumber: string,
+  onData: (data: any) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/machines/${encodeURIComponent(machineNumber)}/live`, {
+    credentials: 'same-origin',
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`SSE ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const chunk = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const line = chunk.split('\n').find(l => l.startsWith('data:'));
+      if (!line) continue;
+      try {
+        const data = JSON.parse(line.slice(5).trim());
+        if (data && data.success !== false) onData(data);
+      } catch { /* 半包忽略 */ }
+    }
+  }
+}
+
 // ==================== 流水 ====================
 export const getTransactions = (limit = 2000) => get<any[]>(`/api/transactions?limit=${limit}`);
 export const addTransaction = (tx: any) => post('/api/transactions', tx);

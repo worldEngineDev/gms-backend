@@ -11,10 +11,9 @@
  * 支持平台：Linux (V4L2)、Windows (DirectShow)、macOS (AVFoundation)
  */
 
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
 const { promisify } = require('util');
 const os = require('os');
-const fs = require('fs');
 
 const execAsync = promisify(exec);
 
@@ -24,6 +23,8 @@ class CameraMonitor {
     this.checkInterval = options.checkInterval || 5000; // 检查间隔（毫秒）
     this.expectedFPS = options.expectedFPS || 30;       // 期望帧率
     this.fpsThreshold = options.fpsThreshold || 0.8;    // 掉帧阈值（80%）
+    this.sampleFrames = options.sampleFrames || 30;
+    this.commandTimeout = options.commandTimeout || Math.max(5000, this.checkInterval - 500);
     this.cameras = [];
     this.monitoring = false;
     this.checkTimer = null;
@@ -60,20 +61,30 @@ class CameraMonitor {
       for (const device of devices) {
         try {
           // 使用 v4l2-ctl 获取设备信息
-          const { stdout: info } = await execAsync(`v4l2-ctl --device=${device} --all 2>/dev/null || echo ""`);
+          const { stdout: info } = await execAsync(`v4l2-ctl --device=${device} --all 2>/dev/null || echo ""`, { timeout: 5000 });
+
+          // Metadata-only nodes (for example RealSense metadata) cannot provide FPS.
+          if (!/Device Caps\s*:[\s\S]*Video Capture/i.test(info)) continue;
 
           // 解析设备名称
           const nameMatch = info.match(/Card type\s*:\s*(.+)/);
           const name = nameMatch ? nameMatch[1].trim() : device;
 
-          // 解析支持的帧率
-          const fpsMatch = info.match(/(\d+\.\d+|\d+)\s*fps/);
+          // 读取当前 V4L2 stream 参数；--all 的输出在不同驱动上格式不一致，
+          // 所以优先匹配 Frames per second，失败时再使用默认值。
+          const fpsMatch = info.match(/Frames per second\s*:\s*(\d+(?:\.\d+)?)/i)
+            || info.match(/(\d+(?:\.\d+)?)\s*fps/i);
           const maxFPS = fpsMatch ? parseFloat(fpsMatch[1]) : 30;
+          const sizeMatch = info.match(/Width\/Height\s*:\s*(\d+)\s*\/\s*(\d+)/i);
+          const pixelFormatMatch = info.match(/Pixel Format\s*:\s*'([^']+)'/i);
 
           cameras.push({
             device,
             name,
             maxFPS,
+            width: sizeMatch ? parseInt(sizeMatch[1], 10) : null,
+            height: sizeMatch ? parseInt(sizeMatch[2], 10) : null,
+            pixelFormat: pixelFormatMatch ? pixelFormatMatch[1].trim() : null,
             currentFPS: 0,
             status: 'unknown',
           });
@@ -85,6 +96,21 @@ class CameraMonitor {
       console.error('[Camera] Linux 摄像头检测失败:', error.message);
     }
 
+    // 将宿主机设备节点映射为业务相机。RealSense 的深度/红外节点不是
+    // 前置视频流，选择彩色节点作为 ego_camera；两个 USB Camera 按稳定的
+    // 设备节点顺序对应左右手腕相机。
+    const realsense = cameras.filter(camera => /realsense/i.test(camera.name));
+    const ego = realsense
+      .filter(camera => !/^Z16/i.test(camera.pixelFormat || ''))
+      .sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0))[0]
+      || realsense[realsense.length - 1];
+    const usb = cameras
+      .filter(camera => /usb camera/i.test(camera.name))
+      .sort((a, b) => a.device.localeCompare(b.device, undefined, { numeric: true }));
+    for (const camera of cameras) camera.cameraId = null;
+    if (ego) ego.cameraId = 'ego_camera';
+    if (usb[0]) usb[0].cameraId = 'wrist_left';
+    if (usb[1]) usb[1].cameraId = 'wrist_right';
     return cameras;
   }
 
@@ -170,36 +196,48 @@ class CameraMonitor {
     }
   }
 
-  // Linux: 使用 ffmpeg 或 v4l2-ctl
+  // Linux: 先实际拉取固定数量的帧，再用耗时计算 FPS。
   async checkFPSLinux(camera) {
+    const startedAt = Date.now();
     try {
-      // 方法1: 使用 ffmpeg 采样（更准确但较慢）
-      const cmd = `timeout 2s ffmpeg -f v4l2 -i ${camera.device} -vframes 60 -f null - 2>&1 | grep -oP 'fps=\\s*\\K[0-9.]+'`;
-      const { stdout } = await execAsync(cmd);
-      const fps = parseFloat(stdout.trim());
-
-      if (!isNaN(fps)) {
-        return {
-          fps,
-          isDropping: fps < this.expectedFPS * this.fpsThreshold,
-          timestamp: new Date().toISOString(),
-        };
-      }
+      await execAsync(
+        `v4l2-ctl --device=${camera.device} --stream-mmap --stream-count=${this.sampleFrames} --stream-to=/dev/null`,
+        { timeout: this.commandTimeout, maxBuffer: 1024 * 1024 }
+      );
+      const elapsed = Math.max(Date.now() - startedAt, 1) / 1000;
+      const measuredFPS = this.sampleFrames / elapsed;
+      // 某些 UVC 驱动会把已排队的帧瞬间吐出，不能把这个 burst
+      // 当成真实帧率；以 V4L2 当前模式上限作保护。
+      const fps = Math.min(measuredFPS, camera.maxFPS || this.expectedFPS);
+      return {
+        fps,
+        isDropping: fps < this.expectedFPS * this.fpsThreshold,
+        timestamp: new Date().toISOString(),
+        method: 'v4l2-stream',
+      };
     } catch (error) {
-      // 方法2: 读取 /sys 信息（快速但不太准确）
+      // Some drivers do not support v4l2-ctl streaming; ffmpeg is the fallback.
       try {
-        const sysPath = `/sys/class/video4linux/${camera.device.replace('/dev/', '')}/device`;
-        if (fs.existsSync(sysPath)) {
-          // 简化处理：假设设备正常工作
+        const { stdout, stderr } = await execAsync(
+          `ffmpeg -hide_banner -loglevel info -f v4l2 -i ${camera.device} -frames:v ${this.sampleFrames} -f null - 2>&1`,
+          { timeout: this.commandTimeout, maxBuffer: 4 * 1024 * 1024 }
+        );
+        const output = `${stdout}\n${stderr}`;
+        const frameMatches = [...output.matchAll(/frame=\s*(\d+)/g)];
+        const frames = frameMatches.length ? parseInt(frameMatches[frameMatches.length - 1][1], 10) : this.sampleFrames;
+        const elapsed = Math.max(Date.now() - startedAt, 1) / 1000;
+        const measuredFPS = frames / elapsed;
+        const fps = Math.min(measuredFPS, camera.maxFPS || this.expectedFPS);
+        if (Number.isFinite(fps) && frames > 0) {
           return {
-            fps: this.expectedFPS,
-            isDropping: false,
+            fps,
+            isDropping: fps < this.expectedFPS * this.fpsThreshold,
             timestamp: new Date().toISOString(),
-            method: 'sysfs',
+            method: 'ffmpeg-stream',
           };
         }
-      } catch (e) {
-        // 忽略
+      } catch (fallbackError) {
+        // The device may be busy or disconnected; report an error instead of fabricating FPS.
       }
     }
 
@@ -281,7 +319,7 @@ class CameraMonitor {
     const checkLoop = async () => {
       if (!this.monitoring) return;
 
-      for (const camera of this.cameras) {
+      await Promise.all(this.cameras.map(async (camera) => {
         const result = await this.checkCameraFPS(camera);
 
         if (result) {
@@ -306,14 +344,17 @@ class CameraMonitor {
               expectedFPS: this.expectedFPS,
               isDropping: result.isDropping,
               status: camera.status,
+              method: result.method || null,
               timestamp: result.timestamp,
             });
           }
         } else {
+          camera.currentFPS = 0;
+          camera.lastCheck = new Date().toISOString();
           camera.status = 'error';
           console.error(`[Camera] ❌ ${camera.name} 检测失败`);
         }
-      }
+      }));
 
       // 继续下一次检查
       this.checkTimer = setTimeout(checkLoop, this.checkInterval);
@@ -338,13 +379,18 @@ class CameraMonitor {
     return {
       monitoring: this.monitoring,
       camerasCount: this.cameras.length,
-      cameras: this.cameras.map(cam => ({
-        name: cam.name,
-        device: cam.device,
-        currentFPS: cam.currentFPS,
-        maxFPS: cam.maxFPS,
+        cameras: this.cameras.map(cam => ({
+        cameraId: cam.cameraId || null,
+          name: cam.name,
+          device: cam.device,
+          currentFPS: cam.currentFPS,
+          maxFPS: cam.maxFPS,
+          width: cam.width || null,
+          height: cam.height || null,
+          pixelFormat: cam.pixelFormat || null,
         status: cam.status,
         lastCheck: cam.lastCheck,
+        isDropping: cam.status === 'dropping',
       })),
     };
   }

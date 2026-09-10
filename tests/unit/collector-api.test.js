@@ -80,5 +80,5 @@ test('collector adapter: polls endpoints independently and preserves successful 
   assert.equal(first.hermes.version, '2.15.1');
   assert.equal(first.hermes.state.controlState, 'ACTIVE');
   assert.equal(first.hermes.endpointStatus.sensors, false);
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 7);
 });

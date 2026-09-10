@@ -469,6 +469,61 @@ input, textarea, select { font-family: var(--sans); -webkit-appearance: none; ap
 }
 .m-modal-close:active { background: var(--text3); color: var(--bg); }
 
+.m-ms-info-actions {
+  display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.m-ms-act {
+  flex: 1 1 calc(50% - 5px); height: 42px; border-radius: 21px;
+  font-size: 14px; font-weight: 600; letter-spacing: 0.02em;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  transition: opacity 0.15s, transform 0.15s;
+}
+.m-ms-act:active { transform: scale(0.97); }
+.m-ms-act:disabled { opacity: 0.55; }
+.m-ms-act-danger { background: #dc2626; border-color: #dc2626; color: #fff; }
+.m-ms-act-danger:active { opacity: 0.88; }
+
+/* ==================== 维护操作命令菜单 ==================== */
+.m-sheet-mask {
+  position: fixed; inset: 0; z-index: 900;
+  background: rgba(0,0,0,0.35);
+  display: flex; align-items: flex-end;
+}
+.m-sheet {
+  width: 100%;
+  background: var(--surface);
+  border-radius: 16px 16px 0 0;
+  padding: 8px 14px calc(14px + env(safe-area-inset-bottom, 0));
+  animation: mSheetUp 0.18s ease;
+}
+@keyframes mSheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+.m-sheet-title {
+  text-align: center; font-size: 13px; color: var(--text3);
+  padding: 10px 0 12px;
+}
+.m-sheet-item {
+  display: block; width: 100%;
+  padding: 14px; margin-bottom: 8px;
+  border: none; border-radius: 12px;
+  background: var(--bg);
+  font-size: 15px; font-weight: 600; color: var(--text);
+  transition: opacity 0.15s;
+}
+.m-sheet-item:active { opacity: 0.7; }
+.m-sheet-item:disabled { opacity: 0.55; }
+.m-sheet-item-fix { color: #1d4ed8; }
+.m-sheet-item-danger { color: #dc2626; }
+.m-sheet-cancel { color: var(--text3); margin-bottom: 0; margin-top: 4px; }
+.m-sheet-sep {
+  display: flex; align-items: center; gap: 6px;
+  margin: 10px 0 8px; padding-top: 8px;
+  font-size: 12px; font-weight: 600; color: var(--text3);
+  border-top: 1px solid var(--border);
+}
+.m-sheet-sep::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
 /* ==================== Toast ==================== */
 .m-toast {
   position: fixed; top: calc(58px + env(safe-area-inset-top, 0));

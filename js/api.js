@@ -677,7 +677,7 @@ const API = {
   // prompt rather than misleading old values. Reset on successful login.
   // (Previously _fetch returned null on 401 and callers silently fell back to localStorage, masking the error.)
 
-  async _fetch(method, path, body) {
+  async _fetch(method, path, body, timeoutMs) {
     if (!this.online) return null;
     if (this._authErrorPending) return null; // short-circuit: token known-bad, don't spam server
     try {
@@ -688,7 +688,7 @@ const API = {
       if (this.csrfToken && m !== 'GET' && m !== 'HEAD' && m !== 'OPTIONS') {
         opts.headers['X-CSRF-Token'] = this.csrfToken;
       }
-      const res = await this._fetchWithTimeout(this.baseURL + path, opts);
+      const res = await this._fetchWithTimeout(this.baseURL + path, opts, timeoutMs);
 
       // 检测 401 错误 - token 过期：置位阻塞标志，触发重新登录流程
       if (res.status === 401) {
@@ -875,6 +875,76 @@ const API = {
   // opts.refresh=true 时服务端跳过心跳快照，强制直连采集器实时抓取
   async getMachineInfo(machineNumber, opts) {
     return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/info' + (opts && opts.refresh ? '?refresh=1' : ''));
+  },
+
+  async stopCollector(machineNumber) {
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/stop-collector');
+  },
+
+  async stopExodus(machineNumber) {
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/stop-exodus');
+  },
+
+  async fixQuest(machineNumber) {
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/fix-quest', null, 170000);
+  },
+
+  async diagnoseHands(machineNumber) {
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/diagnose-hands', null, 180000);
+  },
+  // 灵巧手检测实时进度（agent 侧状态，前端轮询）
+  async diagnoseProgress(machineNumber) {
+    return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/diagnose-progress', null, 8000);
+  },
+  async getMachineConfig(machineNumber) {
+    return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/machine-config', null, 20000);
+  },
+
+  async getMachineCommands(machineNumber) {
+    return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/machine-commands');
+  },
+
+  async runMachineCommand(machineNumber, key) {
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/machine-command', { key }, 40000);
+  },
+  // 机械臂状态切换功能暂未启用，先注释掉
+  // async armControl(machineNumber, action, arm, state) {
+  //   return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/arm-control', { action, arm, state }, 35000);
+  // },
+
+  // 机器实时流（SSE over fetch）：服务端每 ~2s 直连采集器推送；返回 AbortController，调用方 abort() 结束
+  streamMachineLive(machineNumber, onData) {
+    const ctrl = new AbortController();
+    const headers = { Accept: 'text/event-stream' };
+    if (this.token) headers['Authorization'] = `Bearer ${  this.token}`;
+    fetch(`${this.baseURL  }/api/machines/${  encodeURIComponent(machineNumber)  }/live`, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers,
+      signal: ctrl.signal,
+    }).then(async (res) => {
+      if (!res.ok || !res.body) throw new Error('SSE ' + res.status);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const r = await reader.read();
+        if (r.done) break;
+        buf += decoder.decode(r.value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const chunk = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const line = chunk.split('\n').find((l) => l.startsWith('data:'));
+          if (!line) continue;
+          try {
+            const data = JSON.parse(line.slice(5).trim());
+            if (data && data.success !== false) onData(data);
+          } catch (e) { /* 半包忽略 */ }
+        }
+      }
+    }).catch(() => { });
+    return ctrl;
   },
 
   // Transactions

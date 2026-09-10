@@ -14,8 +14,9 @@ class GloveSNDetector {
     this.rdc2Path = '/var/.rdc2';
     this.wujiCalibPath = '/var/.rdc2/wuji_calib';
     this.containerName = options.containerName || 'importer-staging';
-
     this.collectorContainer = options.collectorContainer || process.env.COLLECTOR_CONTAINER || 'mono-staging';
+    this.resolveContainer = typeof options.resolveContainer === 'function' ? options.resolveContainer : null;
+    this.execAsync = options.execAsync || execAsync;
 
     this.gloveIPs = {
       left: '192.168.1.100:50001',
@@ -26,6 +27,40 @@ class GloveSNDetector {
       left: null,
       right: null,
     };
+  }
+
+  async getContainer(role, fallback) {
+    if (this.resolveContainer) {
+      try {
+        const resolved = await this.resolveContainer(role);
+        if (resolved) return resolved;
+        return null;
+      } catch (error) {
+        console.warn(`[SN Detector] ${role} 容器解析失败: ${error.message}`);
+        return null;
+      }
+    }
+    return fallback || null;
+  }
+
+  async runContainerCommand(role, fallback, commandFactory, options = {}) {
+    let container = await this.getContainer(role, fallback);
+    if (!container) return { container: null, stdout: '' };
+    try {
+      const result = await this.execAsync(commandFactory(container), options);
+      return { container, stdout: result.stdout || '' };
+    } catch (error) {
+      const text = [error.message, error.stdout, error.stderr].filter(Boolean).join('\n');
+      if (!/No such container|No such object|is not running|not found/i.test(text) || !this.resolveContainer) throw error;
+      try {
+        container = await this.resolveContainer(role, { force: true });
+        if (!container) return { container: null, stdout: '' };
+        const result = await this.execAsync(commandFactory(container), options);
+        return { container, stdout: result.stdout || '' };
+      } catch (retryError) {
+        throw retryError;
+      }
+    }
   }
 
   async httpRequest(url, options = {}) {
@@ -158,10 +193,11 @@ class GloveSNDetector {
 
   async detectFromContainer() {
     try {
-
-      const { stdout } = await execAsync(
-        `docker exec ${this.containerName} cat /exchange/machine.jsonc 2>/dev/null || echo ""`,
-        { timeout: 5000 }
+      const { stdout } = await this.runContainerCommand(
+        'importer',
+        this.containerName,
+        (container) => `docker exec ${container} cat /exchange/machine.jsonc`,
+        { timeout: 5000 },
       );
 
       if (!stdout) return null;
@@ -284,16 +320,12 @@ class GloveSNDetector {
 
   async detectFromCollectorLogs() {
     try {
-      const cmd = `docker logs --tail 200000 ${this.collectorContainer} 2>&1 | grep -aE "WujiGlove|WujiHand"`;
-      let stdout = '';
-      try {
-        const r = await execAsync(cmd, { timeout: 9000, maxBuffer: 20 * 1024 * 1024 });
-        stdout = r.stdout || '';
-      } catch (e) {
-
-        if (e.stdout) stdout = e.stdout;
-        if (!stdout) return null;
-      }
+      const { stdout } = await this.runContainerCommand(
+        'collector',
+        this.collectorContainer,
+        (container) => `docker logs --tail 200000 ${container}`,
+        { timeout: 9000, maxBuffer: 20 * 1024 * 1024 },
+      );
 
       const result = { left: null, right: null, handLeft: null, handRight: null };
       const snRe = /W(?:G|H)[0-9A-Z][JK][A-Z0-9]{6,}/;

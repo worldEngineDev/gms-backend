@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Alert, Button, Card, Col, Descriptions, Dropdown, Empty, Flex, Input, Modal, Progress, Radio,
   Row, Select, Spin, Statistic, Table, Tag, Tooltip, Typography, message,
@@ -76,8 +76,15 @@ export default function MachineStatusPage() {
     queryKey: ['machine-info', infoMachine],
     queryFn: () => api.getMachineInfo(infoMachine!),
     enabled: !!infoMachine,
-    refetchInterval: 10_000,
   });
+  useEffect(() => {
+    if (!infoMachine) return;
+    const ctrl = new AbortController();
+    api.streamMachineLive(infoMachine, (data) => {
+      qc.setQueryData(['machine-info', infoMachine], data);
+    }, ctrl.signal).catch(() => { });
+    return () => ctrl.abort();
+  }, [infoMachine, qc]);
   const liveInfo = useMutation({
     mutationFn: (m: string) => api.getMachineInfo(m, { refresh: true }),
     onSuccess: (data) => qc.setQueryData(['machine-info', infoMachine], data),
@@ -156,6 +163,7 @@ export default function MachineStatusPage() {
 
   const devTag = (d: any) => {
     if (!d) return <Tag style={{ margin: 0, opacity: 0.5 }}>无</Tag>;
+    if (d.probeConnected === false) return <Tag color="red" style={{ margin: 0 }}>未连接</Tag>;
     const age = d.ageS ?? d.age_s;
     const seen = d.everSeen ?? d.ever_seen;
     if (d.status === 'connected') {
@@ -402,6 +410,7 @@ export default function MachineStatusPage() {
           const info = machineInfo.data;
           const sys = info.system || {};
           const dev = info.devices || {};
+          const wuji = info.wuji || {};
           const task = info.task;
           const csMeta: Record<string, { l: string; c?: string }> = {
             RECORD: { l: '录制中', c: 'red' }, ACTIVE: { l: '就绪', c: 'green' },
@@ -415,6 +424,7 @@ export default function MachineStatusPage() {
             ? { l: '已停止' }
             : (csMeta[sys.controlState] || { l: sys.controlState || '未知' });
           const camName = (n: string) => ({
+            front: '前置相机', left_wrist: '左手腕相机', right_wrist: '右手腕相机',
             ego_camera: '前置相机', wrist_left: '左手腕相机', wrist_right: '右手腕相机',
             vst_left: '头显左眼', vst_right: '头显右眼', overlay: '合成画面',
           } as Record<string, string>)[n] || n;
@@ -428,11 +438,21 @@ export default function MachineStatusPage() {
 
           const netTag = (d: any) => {
             if (!d || d.connected === undefined) return <Tag style={{ margin: 0, opacity: 0.5 }}>无</Tag>;
+            if (d.connected && (d.dataStreamOk === false || d.healthy === false)) {
+              return <Tag color="red" style={{ margin: 0 }}>设备异常</Tag>;
+            }
+            if (d.connected && d.onlineJoints != null && Number(d.onlineJoints) < Number(d.expectedJoints || 20)) {
+              return <Tag color="orange" style={{ margin: 0 }}>关节不全</Tag>;
+            }
             return d.connected
               ? <Tag color="blue" style={{ margin: 0 }}>网络在线</Tag>
               : <Tag color="red" style={{ margin: 0 }}>网络不可达</Tag>;
           };
-          const tagFor = (stream: any, net: any) => (stream ? devTag(stream) : netTag(net));
+          const tagFor = (stream: any, net: any) => (
+            net && (net.dataStreamOk === false || net.healthy === false || (net.onlineJoints != null && Number(net.onlineJoints) < Number(net.expectedJoints || 20)))
+              ? netTag(net)
+              : (stream ? devTag(stream) : netTag(net))
+          );
           return (
             <div>
               {(machineInfo.data as any)?.partial?.importer && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message="Importer(5025) 暂不可达" />}
@@ -490,7 +510,7 @@ export default function MachineStatusPage() {
 
               
               <Card size="small" title="设备状态" style={{ marginBottom: 12 }}>
-                {!dev.dexterousHands?.left && !dev.dexterousHands?.right && !dev.quest && !dev.gloves?.left && !dev.gloves?.right && !dev.cameras?.length && !dev.other?.length && !info.questInfo && !info.devicesNet ? (
+                {!dev.dexterousHands?.left && !dev.dexterousHands?.right && !dev.quest && !dev.gloves?.left && !dev.gloves?.right && !dev.cameras?.length && !dev.other?.length && !info.questInfo && !info.devicesNet && !info.camerasFps?.length && !info.cameras?.length && !info.wuji ? (
                   <div style={{ color: '#8c8c8c', fontSize: 13, padding: '4px 0' }}>
                     采集程序未运行
                   </div>
@@ -504,6 +524,11 @@ export default function MachineStatusPage() {
                           return (
                             <>
                               {net?.snCode && <span style={{ fontFamily: 'monospace' }}>SN: {net.snCode}　</span>}
+                              {net?.onlineJoints != null && (
+                                <span style={{ fontFamily: 'monospace' }}>
+                                  关节 {net.onlineJoints}/{net.expectedJoints || 20}　
+                                </span>
+                              )}
                               {info.teleopDelay && info.teleopDelay[side] != null && <span>延迟 {Math.round(Number(info.teleopDelay[side]))}ms　</span>}
                               {hsLive && (
                                 <span style={{ fontFamily: 'monospace' }}>
@@ -512,10 +537,12 @@ export default function MachineStatusPage() {
                                 </span>
                               )}
                               {net?.connected === false && <span style={{ color: '#cf1322' }}>网络不可达</span>}
+                              {net?.error && <span style={{ color: '#cf1322' }}>{net.error}</span>}
                             </>
                           );
                         };
-                        const lNet = info.devicesNet?.dexterousHands?.left, rNet = info.devicesNet?.dexterousHands?.right;
+                        const lNet = info.devicesNet?.dexterousHands?.left || wuji.dexterousHands?.left;
+                        const rNet = info.devicesNet?.dexterousHands?.right || wuji.dexterousHands?.right;
                         return (
                           <>
                             {cell('灵巧手（左）', tagFor(dev.dexterousHands?.left, lNet), handDetail('left', lNet))}
@@ -534,17 +561,69 @@ export default function MachineStatusPage() {
                             {!qi?.serialNumber && !qi?.batteryLevel && netOff && <span style={{ color: '#cf1322' }}>网络不可达</span>}
                           </span>);
                       })()}
-                      {cell('手套（左）', tagFor(dev.gloves?.left, info.devicesNet?.gloves?.left),
-                        info.devicesNet?.gloves?.left ? <span style={{ fontFamily: 'monospace' }}>SN: {info.devicesNet.gloves.left.snCode || '未读取'}</span> : null)}
-                      {cell('手套（右）', tagFor(dev.gloves?.right, info.devicesNet?.gloves?.right),
-                        info.devicesNet?.gloves?.right ? <span style={{ fontFamily: 'monospace' }}>SN: {info.devicesNet.gloves.right.snCode || '未读取'}</span> : null)}
+                      {(() => {
+                        const gloveDetail = (net: any) => net ? (
+                          <span style={{ fontFamily: 'monospace' }}>
+                            {net.snCode || net.sn ? `SN: ${net.snCode || net.sn}` : 'SN: 未读取'}
+                            {(net.tactileOk != null || net.emfPosesOk != null) && (
+                              <>　触觉 {net.tactileOk ? '✓' : '×'} · 姿态 {net.emfPosesOk ? '✓' : '×'}</>
+                            )}
+                            {net.dataStreamOk != null && <>　数据流 {net.dataStreamOk ? '✓' : '×'}</>}
+                            {(net.tactileFrames != null || net.emfPosesFrames != null) && (
+                              <span>　帧 {net.tactileFrames ?? 0}/{net.emfPosesFrames ?? 0}</span>
+                            )}
+                            {net.error && <span style={{ color: '#cf1322' }}>　{net.error}</span>}
+                          </span>
+                        ) : null;
+                        const lGlove = info.devicesNet?.gloves?.left || wuji.gloves?.left;
+                        const rGlove = info.devicesNet?.gloves?.right || wuji.gloves?.right;
+                        return (
+                          <>
+                            {cell('手套（左）', tagFor(dev.gloves?.left, lGlove), gloveDetail(lGlove))}
+                            {cell('手套（右）', tagFor(dev.gloves?.right, rGlove), gloveDetail(rGlove))}
+                          </>
+                        );
+                      })()}
                       {(dev.marvin || dev.other?.some((o: any) => o.key === 'robot/marvin') || info.devicesNet?.roboticArm) && cell('机械臂 Marvin',
                         tagFor(dev.marvin, info.devicesNet?.roboticArm ? { connected: info.devicesNet.roboticArm.connected } : null),
                         info.devicesNet?.roboticArm && info.devicesNet.roboticArm.connected === false ? <span style={{ color: '#cf1322' }}>网络不可达</span> : null)}
-                      {(dev.cameras || []).map((c: any) => {
+                      {(() => {
+                        const cameraRows = (dev.cameras && dev.cameras.length)
+                          ? dev.cameras
+                          : ((info.camerasFps && info.camerasFps.length)
+                            ? info.camerasFps
+                            : ((info.cameras && info.cameras.length)
+                              ? info.cameras : (info.cameraFps?.cameras || [])));
+                        return cameraRows.map((c: any) => {
+                        const cameraKey = c.name || c.cameraId || c.device;
                         const res = (info.sensors || []).find((s: any) => s.id === c.name);
-                        return cell(camName(c.name), devTag(c), res && res.width ? `${res.width}×${res.height}` : null);
-                      })}
+                        const fpsCamera = (info.cameraFps?.cameras || []).find((x: any) =>
+                          x.cameraId === cameraKey || x.name === cameraKey || x.device === cameraKey
+                          || (x.cameraId === 'ego_camera' && cameraKey === 'front')
+                          || (x.cameraId === 'wrist_left' && cameraKey === 'left_wrist')
+                          || (x.cameraId === 'wrist_right' && cameraKey === 'right_wrist')
+                        ) || c;
+                        const rawFps = fpsCamera && (fpsCamera.currentFPS ?? fpsCamera.fps);
+                        const fps = Number(rawFps);
+                        const fpsDetail = Number.isFinite(fps) && fps > 0
+                          ? `${fps.toFixed(1)} fps`
+                          : 'FPS 暂无';
+                        const resolution = res && res.width ? `${res.width}×${res.height}` : null;
+                        const cameraStatus = Number.isFinite(fps) && fps > 0
+                          ? (fpsCamera.isDropping ? <Tag color="orange" style={{ margin: 0 }}>掉帧</Tag> : <Tag color="green" style={{ margin: 0 }}>正常</Tag>)
+                          : <Tag style={{ margin: 0, opacity: 0.6 }}>无数据</Tag>;
+                        return cell(
+                          camName(cameraKey),
+                          <Flex align="center" gap={6} wrap="wrap">
+                            {dev.cameras?.length ? devTag(c) : cameraStatus}
+                            <span style={{ fontFamily: 'monospace', fontSize: 12, color: Number.isFinite(fps) && fps > 0 ? '#389e0d' : '#8c8c8c' }}>
+                              {fpsDetail}
+                            </span>
+                          </Flex>,
+                          resolution,
+                        );
+                        });
+                      })()}
                     </Flex>
                     {(info.cameraFps?.fps != null || !!info.vstFps) && (() => {
                       const cf = info.cameraFps;
@@ -555,7 +634,7 @@ export default function MachineStatusPage() {
                         : `（${Math.round(age / 3600)} 小时前日志）`;
                       return (
                         <div style={{ fontSize: 11, opacity: 0.65, marginTop: 8 }}>
-                          {cf?.fps != null && <span>编码输出 <b>{Number(cf.fps).toFixed(1)}</b> fps{ageTxt}　·　</span>}
+                          {cf?.fps != null && <span>三路平均 <b>{Number(cf.fps).toFixed(1)}</b> fps{ageTxt}　·　</span>}
                           {!!info.vstFps && <span>透视配置 {info.vstFps} fps</span>}
                         </div>
                       );

@@ -469,23 +469,25 @@ module.exports = function createTechSupportHandlers(deps) {
       if (diagLines.length) detailedDescription += `\n诊断: ${diagLines.join('，')}`;
     }
 
-    // 设备快照：压缩为单行（含 SN / 电量）
-    if (deviceSnapshot) {
+    // 设备快照：只列异常设备（✅ 连接正常的不再显示）。
+    // 降级类告警除外：故障描述已指明是哪个组件连接断开，不再重复罗列
+    // 无关设备（例如手套断开时避免再出现"❌机械臂"）
+    if (deviceSnapshot && alertCode !== 'collector_degraded') {
       const dev = [];
-      if (deviceSnapshot.leftGlove !== undefined) dev.push(`${deviceSnapshot.leftGlove ? '✅' : '❌'}手套L${deviceSnapshot.leftGloveSN ? '/' + deviceSnapshot.leftGloveSN : ''}`);
-      if (deviceSnapshot.rightGlove !== undefined) dev.push(`${deviceSnapshot.rightGlove ? '✅' : '❌'}手套R${deviceSnapshot.rightGloveSN ? '/' + deviceSnapshot.rightGloveSN : ''}`);
-      if (deviceSnapshot.leftDexterous !== undefined) dev.push(`${deviceSnapshot.leftDexterous ? '✅' : '❌'}灵巧手L`);
-      if (deviceSnapshot.rightDexterous !== undefined) dev.push(`${deviceSnapshot.rightDexterous ? '✅' : '❌'}灵巧手R`);
-      if (deviceSnapshot.quest !== undefined) dev.push(`${deviceSnapshot.quest ? '✅' : '❌'}Quest${deviceSnapshot.questBattery ? `(${deviceSnapshot.questBattery}%)` : ''}`);
-      if (deviceSnapshot.roboticArm !== undefined) dev.push(`${deviceSnapshot.roboticArm ? '✅' : '❌'}机械臂`);
-      if (dev.length) detailedDescription += `\n设备: ${dev.join(' ')}`;
+      if (deviceSnapshot.leftGlove === false) dev.push('❌手套L');
+      if (deviceSnapshot.rightGlove === false) dev.push('❌手套R');
+      if (deviceSnapshot.leftDexterous === false) dev.push('❌灵巧手L');
+      if (deviceSnapshot.rightDexterous === false) dev.push('❌灵巧手R');
+      if (deviceSnapshot.quest === false) dev.push('❌Quest');
+      if (deviceSnapshot.roboticArm === false) dev.push('❌机械臂');
+      if (dev.length) detailedDescription += `\n${dev.join(' ')}`;
     }
 
     // 时间
     if (alertContext && alertContext.firstDetected) {
-      detailedDescription += `\n检测时间: ${new Date(alertContext.firstDetected).toLocaleString('zh-CN')}`;
+      detailedDescription += `\n检测 ${new Date(alertContext.firstDetected).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}`;
     } else if (environmentInfo && environmentInfo.lastHeartbeat) {
-      detailedDescription += `\n检测时间: ${new Date(environmentInfo.lastHeartbeat).toLocaleString('zh-CN')}`;
+      detailedDescription += `\n检测 ${new Date(environmentInfo.lastHeartbeat).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}`;
     }
 
     // 原因与建议（故障库中登记的才有）
@@ -562,6 +564,60 @@ module.exports = function createTechSupportHandlers(deps) {
     });
     console.log(`[EDGE-TICKET] 自动建单 ${id}：${machineNumber} ${faultType}（${alertCode || '-'}）`);
     return { ok: true, item };
+  }
+
+  // ============================================================
+  // 录制恢复自动关单（系统自动流）
+  // 采集员自行完成维修后重新开始录制（hermes.state.isRecording 由 false → true 时由 edge 域触发），
+  // 系统自动完成该机器上"系统自动创建"的采集组件类未完成工单，无需运维人工关单。
+  // 仅处理 autoCreated 的采集类工单（这些故障在恢复录制时即视为解除，如手套断联/组件降级/录制器未就绪）；
+  // SN 绑定/库存类告警（hand_mismatch/sn_unusable 等）涉及系统侧数据确认，保持人工关闭，不自动处理。
+  // pending（未响应）也允许完成：采集员现场自修的场景可能从未有人响应工单。
+  // ============================================================
+  const AUTO_CLOSE_ALERT_CODES = new Set([
+    'collector_degraded', 'importer_unreachable', 'hermes_unreachable',
+    'emergency_stopped', 'recorder_not_ready', 'hermes_errors',
+  ]);
+
+  async function autoCompleteCollectorTickets(machineNumber) {
+    if (!machineNumber) return { closed: 0 };
+    const [rows] = await pool.execute(
+      `SELECT id, data FROM tech_support
+       WHERE status_v2 IN ('pending','in_progress') AND machine_no = ?`,
+      [machineNumber]
+    );
+    let closed = 0;
+    for (const row of rows) {
+      let item = null;
+      try { item = JSON.parse(row.data); } catch { continue; }
+      if (!item || item.autoCreated !== true) continue;                     // 只关系统自动建的工单
+      if (!AUTO_CLOSE_ALERT_CODES.has(item.alertCode)) continue;            // 只关采集组件类故障
+      if (item.status === 'completed' || _legacyStatus(item.status) === 'completed') continue;
+      const now = new Date().toISOString();
+      item.status = 'completed';
+      item.completedAt = now;
+      item.result = '系统自动完成：机器已恢复录制，采集组件恢复正常';
+      item.resolutionNote = item.result;
+      item.autoCompletedBy = 'edge_agent_recording';
+      item.repairSeconds = item.respondedAt ? Math.round((new Date(now) - new Date(item.respondedAt)) / 1000) : null;
+      item.totalSeconds = Math.round((new Date(now) - new Date(item.submittedAt)) / 1000);
+      await saveTechSupport(row.id, item);
+      closed++;
+      await _recomputeMachineStatusFromGloves(machineNumber);
+      if (typeof setProductionStatus === 'function') {
+        setProductionStatus({
+          machineNumber, status: 'ready', source: 'ticket',
+          ticketId: row.id, reason: '机器恢复录制，自动完成采集故障工单',
+        }).catch(e => console.error('[Production Status] 录制恢复联动失败:', e.message));
+      }
+      broadcastChange('tech_support', ['machines', 'sn_registry', 'inventory'], { action: 'completed', id: row.id });
+      setImmediate(() => {
+        try { if (realtime && realtime.notifyTechCompleted) realtime.notifyTechCompleted(item); } catch {}
+        try { if (feishu && feishu.syncToFeishu) feishu.syncToFeishu(item).catch(e => console.error('[Feishu] Sync err:', e.message)); } catch {}
+      });
+      console.log(`[TECH_SUPPORT] 录制恢复自动关单: ${machineNumber} ${row.id}（${item.alertCode || '-'}）`);
+    }
+    return { closed };
   }
 
   async function handleRespondTechSupport(req, res, authUser, id) {
@@ -899,6 +955,7 @@ module.exports = function createTechSupportHandlers(deps) {
     handleDeleteCommonFault,
     handleSubmitTechSupport,
     createSystemTicket,
+    autoCompleteCollectorTickets,
     handleRespondTechSupport,
     handleCompleteTechSupport,
     handleDeleteTechSupport,

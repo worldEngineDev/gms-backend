@@ -1,0 +1,30 @@
+---
+# 巡检：执行设备专属探针 collect，stdout 直接输出 JSONL（每行一个探针结果）。
+# 服务端 Worker 从 ansible stdout 中 grep JSON 行解析，写 metric 表 + station_snapshot。
+# 见 docs/architecture.md「Worker 的巡检与执行职责」。
+- name: Poll device probes
+  hosts: all
+  gather_facts: false
+  vars:
+    probe_names: "all"
+  tasks:
+    - name: Copy probe scripts
+      ansible.builtin.copy:
+        src: "files/probes/"
+        dest: "/tmp/galio_probes/"
+        mode: "0755"
+
+    - name: Run all probes and emit JSONL to stdout
+      ansible.builtin.shell: |
+        probes="{{ probe_names }}"
+        if [ "$probes" = "all" ]; then
+          probes="arm hand glove quest camera link svc"
+        fi
+        for p in $(echo "$probes" | tr ',' ' '); do
+          raw=$(python3 /tmp/galio_probes/$p.py collect 2>/dev/null || echo '{}')
+          echo "{\"probe\":\"$p\",\"result\":$raw}"
+        done
+      args:
+        executable: /bin/bash
+      register: probe_output
+      changed_when: false

@@ -1,0 +1,64 @@
+# 见 docs/architecture.md「技术选型」：nginx/traefik + api×N + worker×N + postgres + registry。
+# 这里先起 postgres/api/worker/frontend 四个服务，可以直接 up 起来看 OpenAPI 文档、跑通前端骨架；
+# nginx/traefik 反向代理（统一 80 端口、/api 前缀转发）和现场自托管 registry 留到部署阶段接，
+# 见各 Dockerfile 里的 TODO 和 docs/api-design.md 待定问题 A1。
+#
+# 副本数按负载调整：docker compose up --scale api=3 --scale worker=2
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: galio
+      POSTGRES_PASSWORD: galio
+      POSTGRES_DB: galio
+    volumes:
+      # PG18+ 官方镜像换了数据目录约定：整卷挂 /var/lib/postgresql（不是 .../data），
+      # 内部按大版本号分子目录存放，为 pg_ctlcluster 风格的 pg_upgrade --link 做准备；
+      # 挂到 .../data 会在启动时直接报错拒绝跑，不是能忽略的 warning。
+      - pgdata:/var/lib/postgresql
+    ports:
+      - "5432:5432"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      GALIO_DATABASE_URL: postgresql+psycopg://galio:galio@postgres:5432/galio
+      GALIO_ANSIBLE_PROJECT_DIR: /ansible
+      GALIO_SSH_PRIVATE_KEY_PATH: /secrets/galio_station_key
+    volumes:
+      # POST /check-runs 同步执行，api 进程会直接调 ansible-playbook，跟 worker 需要同一套挂载。
+      - ./ansible:/ansible:ro
+      - ./secrets:/secrets:ro
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      GALIO_DATABASE_URL: postgresql+psycopg://galio:galio@postgres:5432/galio
+      GALIO_ANSIBLE_PROJECT_DIR: /ansible
+      GALIO_SSH_PRIVATE_KEY_PATH: /secrets/galio_station_key
+    volumes:
+      - ./ansible:/ansible:ro
+      # TODO: SSH 私钥托管方案未定（见 docs/database-schema.md 设计评审 Q5），
+      # 这里先挂一个本地目录占位，实现阶段换成真正的 secrets 管理方式（Ansible Vault 等）。
+      - ./secrets:/secrets:ro
+    depends_on:
+      - postgres
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:

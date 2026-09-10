@@ -1,0 +1,22 @@
+---
+# 把探针脚本推到工位并执行一次，见 docs/architecture.md「探针脚本协议」。
+#
+# TODO: 这里假设调用方（extra_vars）已经给出 probe_name（arm/hand/glove/quest/camera/env/link/svc）
+# 和 probe_action（describe/collect/check）。"某工位这次巡检该跑哪些探针"这个编排——即根据
+# check_suite/check_item 或工位绑定的设备类型选出探针清单——留给上一层（backend/app/execution
+# 或调用方 playbook）在实现阶段接线，这个 role 只负责单个探针的推送与执行。
+- name: Copy probe scripts
+  ansible.builtin.copy:
+    src: "files/probes/"
+    dest: "/tmp/galio_probes/"
+    mode: "0755"
+
+- name: Run probe action
+  ansible.builtin.command:
+    cmd: "python3 /tmp/galio_probes/{{ probe_name }}.py {{ probe_action }} {{ probe_item_id | default('') }}"
+  register: probe_result
+  changed_when: false
+
+- name: Show probe output
+  ansible.builtin.debug:
+    var: probe_result.stdout

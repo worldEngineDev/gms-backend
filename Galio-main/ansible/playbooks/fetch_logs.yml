@@ -1,0 +1,12 @@
+---
+# 按需拉取指定日志文件。见 docs/architecture.md「Worker 的巡检与执行职责 > 日志拉取」。
+# log_path 由调用方通过 -e log_path=... 传入。
+- name: Fetch logs
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: fetch log file
+      ansible.builtin.fetch:
+        src: "{{ log_path }}"
+        dest: "./fetched_logs/{{ inventory_hostname }}/"
+        flat: false

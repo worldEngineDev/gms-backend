@@ -1,0 +1,18 @@
+# Python (backend/)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node (frontend/)
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 环境变量与密钥（见 docker-compose.yml 里 worker 的 secrets 挂载）
+.env
+secrets/
+
+# 编辑器/系统
+.DS_Store

@@ -1,0 +1,55 @@
+---
+# 发布/回滚下发：按 artifact_type 分派到对应部署方式。
+# artifact_type 由服务端通过 -e 传入（image|package|config_template）。
+- name: Deploy artifact
+  hosts: all
+  gather_facts: false
+  vars:
+    artifact_type: "package"
+    artifact_name: ""
+    artifact_version: ""
+    image_ref: ""
+    checksum: ""
+  tasks:
+    - name: Copy probe scripts (for post-deploy verification)
+      ansible.builtin.copy:
+        src: "files/probes/"
+        dest: "/tmp/galio_probes/"
+        mode: "0755"
+
+    - name: Deploy docker image
+      ansible.builtin.shell: |
+        docker pull {{ image_ref }}
+        docker stop {{ artifact_name }} 2>/dev/null || true
+        docker rm {{ artifact_name }} 2>/dev/null || true
+        docker run -d --name {{ artifact_name }} --restart unless-stopped \
+          {{ image_ref }}
+      args:
+        executable: /bin/bash
+      when: artifact_type == "image"
+      register: image_deploy
+      changed_when: true
+
+    - name: Deploy package
+      ansible.builtin.shell: |
+        echo "Deploying {{ artifact_name }} version {{ artifact_version }}"
+        echo "Checksum: {{ checksum }}"
+        # 包管理器下发逻辑——具体实现取决于包格式（deb/rpm/tar）
+        echo "Package deploy placeholder"
+      args:
+        executable: /bin/bash
+      when: artifact_type == "package"
+      register: package_deploy
+      changed_when: false
+
+    - name: Deploy config template
+      ansible.builtin.shell: |
+        echo "Deploying config {{ artifact_name }} version {{ artifact_version }}"
+        echo "Checksum: {{ checksum }}"
+        # 配置文件下发——具体路径取决于 config_template.applies_to
+        echo "Config deploy placeholder"
+      args:
+        executable: /bin/bash
+      when: artifact_type == "config_template"
+      register: config_deploy
+      changed_when: false

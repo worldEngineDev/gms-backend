@@ -1,0 +1,41 @@
+---
+# 检测执行：体检/验收/发布核验/交接四场景复用同一个 playbook。
+# check_items_json 由服务端通过 -e 传入（JSON 数组，每项含 probe + item_id）。
+# 输出：每行 JSON {"item_id":"...","probe":"...","result":"pass|fail|unknown","evidence":{},"suggestion":"..."}
+- name: Run check suite
+  hosts: all
+  gather_facts: false
+  vars:
+    check_items_json: "[]"
+  tasks:
+    - name: Copy probe scripts
+      ansible.builtin.copy:
+        src: "files/probes/"
+        dest: "/tmp/galio_probes/"
+        mode: "0755"
+
+    - name: Run check for each item and emit JSONL to stdout
+      ansible.builtin.shell: |
+        items='{{ check_items_json }}'
+        echo "$items" | python3 -c "
+        import sys, json, subprocess
+        items = json.load(sys.stdin)
+        for item in items:
+            probe = item.get('probe', '')
+            item_id = item.get('item_id', '')
+            try:
+                r = subprocess.run(
+                    ['python3', '/tmp/galio_probes/' + probe + '.py', 'check', item_id],
+                    capture_output=True, text=True, timeout=30
+                )
+                result = json.loads(r.stdout) if r.returncode == 0 else {
+                    'result': 'unknown', 'evidence': {}, 'suggestion': 'probe failed: ' + r.stderr
+                }
+            except Exception as e:
+                result = {'result': 'unknown', 'evidence': {}, 'suggestion': str(e)}
+            print(json.dumps({'item_id': item_id, 'probe': probe, **result}))
+        "
+      args:
+        executable: /bin/bash
+      register: check_output
+      changed_when: false

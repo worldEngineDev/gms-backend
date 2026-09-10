@@ -9,7 +9,7 @@
     "lint": "eslint . --ext .js --max-warnings 1000",
     "lint:fix": "eslint . --ext .js --fix",
     "lint:strict": "eslint . --ext .js --max-warnings 50",
-    "test": "node --test tests/unit/",
+    "test": "node --test tests/unit/*.test.js",
     "test:unit": "node tests/run-unit-tests.js",
     "test:integration": "node test_functional.js",
     "test:stress": "node test_concurrent.js",

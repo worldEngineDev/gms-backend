@@ -19,6 +19,7 @@ module.exports = function createMachinesHandlers(deps) {
     broadcastChange,
     broadcastSSE,
     loadEdgePresence,
+    getEdgeLive,
   } = deps;
 
   function handleGetMachineCode(req, res) {
@@ -723,6 +724,334 @@ module.exports = function createMachinesHandlers(deps) {
     return res.json();
   }
 
+  async function handleStopCollector(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      let hostOnline = false;
+      if (typeof loadEdgePresence === 'function') {
+        try {
+          const presence = await loadEdgePresence();
+          const ep = presence && presence[machineNumber];
+          hostOnline = !!(ep && ep.hostOnline);
+        } catch { }
+      }
+      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
+      const token = process.env.EDGE_TOKEN || '';
+      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+      const r = await fetch(`http://${ip}:3000/stop-collector`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(35000),
+        headers: { 'x-edge-token': token, Accept: 'application/json' },
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
+      }
+      broadcastChange('machines', null, { machineNumber });
+      sendJSON(res, { success: true, container: body.container, machineNumber });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接采集器主机上的心跳代理'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  async function handleStopExodus(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      let hostOnline = false;
+      if (typeof loadEdgePresence === 'function') {
+        try {
+          const presence = await loadEdgePresence();
+          const ep = presence && presence[machineNumber];
+          hostOnline = !!(ep && ep.hostOnline);
+        } catch { }
+      }
+      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
+      const token = process.env.EDGE_TOKEN || '';
+      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+      const r = await fetch(`http://${ip}:3000/stop-exodus`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(35000),
+        headers: { 'x-edge-token': token, Accept: 'application/json' },
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
+      }
+      broadcastChange('machines', null, { machineNumber });
+      sendJSON(res, { success: true, container: body.container, machineNumber });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接采集器主机上的心跳代理'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  async function handleFixQuest(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      let hostOnline = false;
+      if (typeof loadEdgePresence === 'function') {
+        try {
+          const presence = await loadEdgePresence();
+          const ep = presence && presence[machineNumber];
+          hostOnline = !!(ep && ep.hostOnline);
+        } catch { }
+      }
+      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
+      const token = process.env.EDGE_TOKEN || '';
+      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+      const r = await fetch(`http://${ip}:3000/fix-quest`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(150000),
+        headers: { 'x-edge-token': token, Accept: 'application/json' },
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
+      }
+      broadcastChange('machines', null, { machineNumber });
+      sendJSON(res, { success: true, pid: body.pid || null, machineNumber });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接采集器主机上的心跳代理'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  async function handleDiagnoseHands(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      let hostOnline = false;
+      if (typeof loadEdgePresence === 'function') {
+        try {
+          const presence = await loadEdgePresence();
+          const ep = presence && presence[machineNumber];
+          hostOnline = !!(ep && ep.hostOnline);
+        } catch { }
+      }
+      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
+      const token = process.env.EDGE_TOKEN || '';
+      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+      const r = await fetch(`http://${ip}:3000/diagnose-hands`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(175000),
+        headers: { 'x-edge-token': token, Accept: 'application/json' },
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
+      }
+      sendJSON(res, { success: true, hands: body.hands || [], machineNumber });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接采集器主机上的心跳代理'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  // 灵巧手检测进度（agent 侧实时状态，前端轮询用）
+  async function handleDiagnoseProgress(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      const token = process.env.EDGE_TOKEN || '';
+      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+      const r = await fetch(`http://${ip}:3000/diagnose-progress`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(8000),
+        headers: { 'x-edge-token': token, Accept: 'application/json' },
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
+      }
+      sendJSON(res, { success: true, progress: body.progress || null, machineNumber });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接采集器主机上的心跳代理'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  async function handleMachineConfig(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      const token = process.env.EDGE_TOKEN || '';
+      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+      const r = await fetch(`http://${ip}:3000/machine-config`, {
+        headers: { 'x-edge-token': token, Accept: 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
+      }
+      sendJSON(res, { success: true, config: body.config, raw: body.raw });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接采集器主机上的心跳代理'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  // ==================== 通用命令按钮注册表 ====================
+  // 前端"维护操作"面板的命令按钮即由本表生成；新增按钮只需在此加一行
+  // cmd 必须能被 gms-heartbeat-agent 的 /exec 白名单匹配
+  const MACHINE_COMMANDS = [
+    { key: 'container-ps', label: '查看容器状态', cmd: 'docker ps -a', danger: false, timeout: 10000, showOutput: true },
+  ];
+
+  async function handleMachineCommands(req, res, user, machineNumber) {
+    if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+    if (!user || !['admin', 'superadmin'].includes(user.role)) {
+      return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+    }
+    sendJSON(res, {
+      success: true,
+      commands: MACHINE_COMMANDS.map(({ key, label, danger, showOutput }) => ({ key, label, danger, showOutput })),
+    });
+  }
+
+  async function handleMachineCommand(req, res, user, machineNumber, body) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const key = body && body.key;
+      const cmdDef = MACHINE_COMMANDS.find((c) => c.key === key);
+      if (!cmdDef) return sendJSON(res, { error: '未知命令: ' + key }, 400);
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      let hostOnline = false;
+      if (typeof loadEdgePresence === 'function') {
+        try {
+          const presence = await loadEdgePresence();
+          const ep = presence && presence[machineNumber];
+          hostOnline = !!(ep && ep.hostOnline);
+        } catch { }
+      }
+      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
+      const token = process.env.EDGE_TOKEN || '';
+      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+      const r = await fetch(`http://${ip}:3000/exec`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(cmdDef.timeout + 5000),
+        headers: { 'x-edge-token': token, Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cmd: cmdDef.cmd, timeout: cmdDef.timeout }),
+      });
+      const body2 = await r.json().catch(() => ({}));
+      if (!r.ok || body2.ok === false) {
+        return sendJSON(res, { error: body2.error || `agent 返回 HTTP ${r.status}` }, 502);
+      }
+      if (cmdDef.showOutput) {
+        return sendJSON(res, { success: true, output: body2.stdout || '', cmd: cmdDef.cmd, machineNumber });
+      }
+      broadcastChange('machines', null, { machineNumber });
+      sendJSON(res, { success: true, machineNumber });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接采集器主机上的心跳代理'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  /*
+   * 机械臂状态切换功能暂未启用（SDK 硬编码绑定 UDP 4730，与 mono 采集器占用冲突），先注释掉
+   */
+  // async function handleArmControl(req, res, user, machineNumber, body) {
+  //   try {
+  //     if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+  //     if (!user || !['admin', 'superadmin'].includes(user.role)) {
+  //       return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+  //     }
+  //     body = body || {};
+  //     const action = body.action;
+  //     const arm = (body.arm || 'A').toUpperCase();
+  //     const state = body.state !== undefined ? parseInt(body.state, 10) : undefined;
+  //     if (!action) return sendJSON(res, { error: '缺少 action 参数' }, 400);
+  //     if (!['A','B','AB'].includes(arm)) return sendJSON(res, { error: 'arm 必须为 A、B 或 AB' }, 400);
+  //     if (action === 'set_state' && (isNaN(state) || state < 0 || state > 4)) {
+  //       return sendJSON(res, { error: 'state 必须为 0-4: 0=下伺服 1=位置跟随 2=PVT 3=扭矩 4=协作释放' }, 400);
+  //     }
+  //     const ip = collectorIpOf(machineNumber);
+  //     if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+  //     let hostOnline = false;
+  //     if (typeof loadEdgePresence === 'function') {
+  //       try {
+  //         const presence = await loadEdgePresence();
+  //         const ep = presence && presence[machineNumber];
+  //         hostOnline = !!(ep && ep.hostOnline);
+  //       } catch { }
+  //     }
+  //     if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
+  //     const token = process.env.EDGE_TOKEN || '';
+  //     if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
+  //     const r = await fetch(`http://${ip}:3000/arm-control`, {
+  //       method: 'POST',
+  //       signal: AbortSignal.timeout(35000),
+  //       headers: { 'x-edge-token': token, 'Content-Type': 'application/json', Accept: 'application/json' },
+  //       body: JSON.stringify({ action, arm, state: isNaN(state) ? undefined : state }),
+  //     });
+  //     const result = await r.json().catch(() => ({}));
+  //     if (!r.ok || result.ok === false) {
+  //       return sendJSON(res, { error: result.error || `agent 返回 HTTP ${r.status}` }, 502);
+  //     }
+  //     sendJSON(res, { success: true, ...result, machineNumber });
+  //   } catch (e) {
+  //     const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+  //     const msg = refused || e.name === 'TimeoutError'
+  //       ? '无法连接采集器主机上的心跳代理'
+  //       : (e.message || '操作失败');
+  //     sendJSON(res, { error: msg }, 502);
+  //   }
+  // }
+
   function _stateTopicMap(state) {
     const items = (state && state.robots && state.robots.robot_1) || [];
     const map = {};
@@ -745,10 +1074,10 @@ module.exports = function createMachinesHandlers(deps) {
         ageS: typeof ageRaw === 'number' ? Math.round(ageRaw * 10) / 10 : null,
         everSeen: ages[key] ? !!ages[key].ever_seen : null,
       };
-      if (key === 'robot/wuji_hand_l' || key === 'robot/wuji_glove_l') out.dexterousHands.left = entry;
-      else if (key === 'robot/wuji_hand_r' || key === 'robot/wuji_glove_r') out.dexterousHands.right = entry;
-      else if (key === 'gello/wuji_glove_l') out.gloves.left = entry;
-      else if (key === 'gello/wuji_glove_r') out.gloves.right = entry;
+      if (key === 'robot/wuji_hand_l') out.dexterousHands.left = entry;
+      else if (key === 'robot/wuji_hand_r') out.dexterousHands.right = entry;
+      else if (key === 'robot/wuji_glove_l' || key === 'gello/wuji_glove_l') out.gloves.left = entry;
+      else if (key === 'robot/wuji_glove_r' || key === 'gello/wuji_glove_r') out.gloves.right = entry;
       else if (key === 'gello/quest_controller' || key === 'quest/overlay') out.quest = entry;
       else if (key === 'robot/marvin') out.marvin = entry;
       else if (key.startsWith('camera/')) out.cameras.push({ name: key.slice('camera/'.length), ...entry });
@@ -756,6 +1085,175 @@ module.exports = function createMachinesHandlers(deps) {
     }
     out.cameras.sort((a, b) => a.name.localeCompare(b.name));
     return out;
+  }
+
+  // 心跳代理会把 Wuji SDK 的详细诊断放在 wuji，同时把兼容摘要放在
+  // devices.devicesNet。这里统一补齐 devicesNet，保证“机器状态”所有
+  // 读取路径（数据库快照、实时 SSE、直连抓取）都能看到同一套字段。
+  function _mergeWujiDevices(devicesNet, wuji) {
+    const source = devicesNet || {};
+    const out = {
+      gloves: { ...(source.gloves || {}) },
+      dexterousHands: { ...(source.dexterousHands || {}) },
+      roboticArm: source.roboticArm || null,
+    };
+    const copySide = (kind, side) => {
+      const sdk = wuji && wuji[kind] && wuji[kind][side];
+      if (!sdk || typeof sdk !== 'object') return;
+      const current = out[kind][side] && typeof out[kind][side] === 'object'
+        ? out[kind][side] : {};
+      out[kind][side] = {
+        ...current,
+        ...sdk,
+        snCode: sdk.sn || current.snCode || null,
+        ip: sdk.ip || current.ip || null,
+      };
+    };
+    copySide('gloves', 'left');
+    copySide('gloves', 'right');
+    copySide('dexterousHands', 'left');
+    copySide('dexterousHands', 'right');
+    const hasAny = Object.keys(out.gloves).length
+      || Object.keys(out.dexterousHands).length
+      || !!out.roboticArm;
+    return hasAny ? out : null;
+  }
+
+  function _edgeInfoFromPresence(ep) {
+    if (!ep) return null;
+    return {
+      machineType: ep.machineType || null,
+      devicesNet: _mergeWujiDevices(ep.edgeDevices || null, ep.edgeWuji || null),
+      questInfo: ep.edgeQuest ? {
+        netConnected: !!ep.edgeQuest.connected,
+        serialNumber: ep.edgeQuest.serialNumber || null,
+        adbStatus: ep.edgeQuest.adbStatus || null,
+        batteryLevel: ep.edgeQuest.battery && ep.edgeQuest.battery.level != null ? ep.edgeQuest.battery.level : null,
+        batteryStatus: ep.edgeQuest.battery && ep.edgeQuest.battery.status ? ep.edgeQuest.battery.status : null,
+        batteryTemp: ep.edgeQuest.battery && ep.edgeQuest.battery.temperature != null ? ep.edgeQuest.battery.temperature : null,
+        controllers: ep.edgeQuest.controllers || null,
+      } : null,
+      cameraFps: ep.edgeCameraFps || null,
+      cameras: ep.edgeCameras || [],
+      encoderFps: ep.edgeEncoderFps || null,
+      wuji: ep.edgeWuji || null,
+      handStream: ep.edgeHandStream || null,
+    };
+  }
+
+  function _composeLiveInfo(machineNumber, settled, edge) {
+    const [coreR, healthR, versionR, stateR, sensorsR] = settled;
+    const core = coreR.status === 'fulfilled' ? coreR.value : null;
+    const hermesHealth = healthR.status === 'fulfilled' ? healthR.value : null;
+    const hermesVersion = versionR.status === 'fulfilled' && versionR.value && versionR.value.content
+      ? versionR.value.content.version : null;
+    const stateMap = stateR.status === 'fulfilled' ? _stateTopicMap(stateR.value) : {};
+
+    const ciInfo = (core && core.collector_info && core.collector_info.info) || {};
+    const devices = _groupComponents(ciInfo.components || (hermesHealth && hermesHealth.components) || {}, hermesHealth && hermesHealth.components);
+
+    const dnet = _mergeWujiDevices(edge && edge.devicesNet, edge && edge.wuji);
+    if (dnet) {
+      const probe = (obj, hand) => (obj && hand && obj[hand] && typeof obj[hand].connected === 'boolean')
+        ? !!obj[hand].connected : null;
+      if (devices.dexterousHands && devices.dexterousHands.left) devices.dexterousHands.left.probeConnected = probe(dnet.dexterousHands, 'left');
+      if (devices.dexterousHands && devices.dexterousHands.right) devices.dexterousHands.right.probeConnected = probe(dnet.dexterousHands, 'right');
+      if (devices.gloves && devices.gloves.left) devices.gloves.left.probeConnected = probe(dnet.gloves, 'left');
+      if (devices.gloves && devices.gloves.right) devices.gloves.right.probeConnected = probe(dnet.gloves, 'right');
+      if (devices.marvin && dnet.roboticArm && typeof dnet.roboticArm.connected === 'boolean') {
+        devices.marvin.probeConnected = !!dnet.roboticArm.connected;
+      }
+    }
+    if (edge && edge.machineType === 'glove_only') {
+      devices.dexterousHands = { left: null, right: null };
+      devices.marvin = null;
+    }
+
+    const tc = core && core.task_config && core.task_config.id ? core.task_config : null;
+    const tpl = (tc && tc.template) || {};
+    const op = (tc && tc.operator) || {};
+    const task = tc ? {
+      id: tc.id,
+      name: tpl.ref_name || tpl.name || '未知任务',
+      state: tc.state || null,
+      hours: tc.hours != null ? tc.hours : null,
+      hoursCompleted: tc.hours_completed != null ? tc.hours_completed : 0,
+      percent: tc.hours ? Math.min(100, Math.round(((tc.hours_completed || 0) / tc.hours) * 100)) : null,
+      createTime: tc.create_time || null,
+      endTime: tc.end_time || null,
+      isTraining: !!tpl.is_training,
+      operator: {
+        name: op.name || op.localized_name || '未知',
+        level: op.level != null ? op.level : null,
+        email: op.email || null,
+        state: op.state || null,
+      },
+      steps: (tpl.steps && tpl.steps.payload) || [],
+      verbs: tpl.verbs || [],
+      objects: tpl.objects || [],
+    } : null;
+
+    const misc = (core && core.machine_config && core.machine_config.misc) || {};
+    const containers = Object.entries((core && core.containers) || {}).map(([name, status]) => ({ name, status }));
+
+    const _refused = r => {
+      if (r.status !== 'rejected') return false;
+      const cause = r.reason && r.reason.cause;
+      return !!(cause && (cause.code === 'ECONNREFUSED' || cause.code === 'ECONNRESET'));
+    };
+    const hermesAllDown = !hermesHealth && !hermesVersion && !Object.keys(stateMap).length;
+    const hermesOffline = hermesAllDown && _refused(healthR) && _refused(versionR) && _refused(stateR);
+
+    return {
+      success: true,
+      machineNumber,
+      source: 'live',
+      dataAgeSec: 0,
+      collectorName: misc.machine_id || null,
+      computerId: misc.computer_id || null,
+      importerVersion: (core && core.version) || null,
+      collectorVersion: hermesVersion,
+      channel: (core && core.channel) || null,
+      vstFps: (core && core.machine_config && core.machine_config.vst && core.machine_config.vst.fps) != null
+        ? core.machine_config.vst.fps : null,
+      sensors: sensorsR.status === 'fulfilled' && Array.isArray(sensorsR.value) ? sensorsR.value : null,
+      teleopDelay: {
+        left: stateMap['teleop/hand_left/delay'] != null ? stateMap['teleop/hand_left/delay'] : null,
+        right: stateMap['teleop/hand_right/delay'] != null ? stateMap['teleop/hand_right/delay'] : null,
+      },
+      questInfo: (edge && edge.questInfo) || null,
+      devicesNet: dnet,
+      cameraFps: (edge && edge.cameraFps) || null,
+      camerasFps: (edge && edge.cameraFps && Array.isArray(edge.cameraFps.cameras))
+        ? edge.cameraFps.cameras
+        : ((edge && Array.isArray(edge.cameras)) ? edge.cameras : []),
+      cameras: (edge && Array.isArray(edge.cameras)) ? edge.cameras : [],
+      encoderFps: (edge && edge.encoderFps) || null,
+      wuji: (edge && edge.wuji) || null,
+      handStream: (edge && edge.handStream) || null,
+      system: {
+        activity: (core && core.activity) || null,
+        collectorAlive: !!(core && core.is_collector_alive),
+        observerAlive: !!(core && core.is_observer_alive),
+        loggedIn: !!(core && core.is_logged_in),
+        idleTimeSecs: (core && core.idle_time_secs) != null ? core.idle_time_secs : null,
+        controlState: stateMap.control_state || ciInfo.status || null,
+        isRecording: !!stateMap.is_recording,
+        emergencyStopped: !!stateMap.is_emergency_stopped,
+        errorCount: stateMap.error_count != null ? stateMap.error_count : (ciInfo.errors ? ciInfo.errors.length : 0),
+      },
+      containers,
+      devices,
+      task,
+      degraded: ciInfo.degraded || (hermesHealth && hermesHealth.degraded) || [],
+      errors: ciInfo.errors || (hermesHealth && hermesHealth.errors) || [],
+
+      partial: {
+        importer: !core,
+        hermesOffline,
+        hermesFailed: hermesAllDown && !hermesOffline,
+      },
+    };
   }
 
   async function handleGetMachineInfo(req, res, user, machineNumber) {
@@ -767,16 +1265,19 @@ module.exports = function createMachinesHandlers(deps) {
       const url = new URL(req.url, 'http://x');
       const forceLive = url.searchParams.get('refresh') === '1';
 
+      let edgePresence = null;
+      try {
+        const presence = await loadEdgePresence();
+        edgePresence = presence && presence[machineNumber] ? presence[machineNumber] : null;
+      } catch { }
+
       let snap = null;
-      if (!forceLive) {
-        try {
-          const presence = await loadEdgePresence();
-          const ep = presence && presence[machineNumber];
-          if (ep && ep.hostLastSeen && (ep.importer || ep.hermes)
-            && Date.now() - new Date(ep.hostLastSeen).getTime() < 90 * 1000) {
-            snap = ep;
-          }
-        } catch {                            }
+      if (!forceLive && edgePresence && edgePresence.hostLastSeen
+        && Date.now() - new Date(edgePresence.hostLastSeen).getTime() < 90 * 1000
+        && (edgePresence.hostOnline || edgePresence.importer || edgePresence.hermes
+          || edgePresence.edgeDevices || edgePresence.edgeWuji
+          || edgePresence.edgeCameraFps || edgePresence.edgeCameras?.length)) {
+        snap = edgePresence;
       }
 
       if (snap) {
@@ -803,6 +1304,23 @@ module.exports = function createMachinesHandlers(deps) {
         }
         devices.cameras.sort((a, b) => a.name.localeCompare(b.name));
 
+        const dnet0 = _mergeWujiDevices(snap.edgeDevices || null, snap.edgeWuji || null);
+        if (dnet0) {
+          const probe = (obj, hand) => (obj && hand && obj[hand] && typeof obj[hand].connected === 'boolean')
+            ? !!obj[hand].connected : null;
+          if (devices.dexterousHands.left) devices.dexterousHands.left.probeConnected = probe(dnet0.dexterousHands, 'left');
+          if (devices.dexterousHands.right) devices.dexterousHands.right.probeConnected = probe(dnet0.dexterousHands, 'right');
+          if (devices.gloves.left) devices.gloves.left.probeConnected = probe(dnet0.gloves, 'left');
+          if (devices.gloves.right) devices.gloves.right.probeConnected = probe(dnet0.gloves, 'right');
+          if (devices.marvin && dnet0.roboticArm && typeof dnet0.roboticArm.connected === 'boolean') {
+            devices.marvin.probeConnected = !!dnet0.roboticArm.connected;
+          }
+        }
+        if (snap.machineType === 'glove_only') {
+          devices.dexterousHands = { left: null, right: null };
+          devices.marvin = null;
+        }
+
         const it = imp.task || null;
         const task = it ? {
           id: it.id,
@@ -826,7 +1344,7 @@ module.exports = function createMachinesHandlers(deps) {
         const herDown = her.reachable === false;
 
         const q = snap.edgeQuest || null;
-        const dnet = snap.edgeDevices || null;
+        const dnet = _mergeWujiDevices(snap.edgeDevices || null, snap.edgeWuji || null);
         const sensors = Array.isArray(her.sensors) ? her.sensors : null;
         sendJSON(res, {
           success: true,
@@ -840,6 +1358,12 @@ module.exports = function createMachinesHandlers(deps) {
           channel: imp.channel || null,
           vstFps: imp.vst && imp.vst.fps != null ? imp.vst.fps : null,
           cameraFps: snap.edgeCameraFps || null,
+          camerasFps: snap.edgeCameraFps && Array.isArray(snap.edgeCameraFps.cameras)
+            ? snap.edgeCameraFps.cameras
+            : (snap.edgeCameras || []),
+          cameras: snap.edgeCameras || [],
+          encoderFps: snap.edgeEncoderFps || null,
+          wuji: snap.edgeWuji || null,
           handStream: snap.edgeHandStream || null,
           sensors,
           teleopDelay: (her.state && her.state.teleopDelay) || null,
@@ -852,11 +1376,7 @@ module.exports = function createMachinesHandlers(deps) {
             batteryTemp: q.battery && q.battery.temperature != null ? q.battery.temperature : null,
             controllers: q.controllers || null,
           } : null,
-          devicesNet: dnet ? {
-            gloves: dnet.gloves || null,
-            dexterousHands: dnet.dexterousHands || null,
-            roboticArm: dnet.roboticArm || null,
-          } : null,
+          devicesNet: dnet,
           system: {
             activity: imp.activity || null,
             collectorAlive: imp.collectorAlive != null ? !!imp.collectorAlive : (her.reachable !== false),
@@ -898,102 +1418,136 @@ module.exports = function createMachinesHandlers(deps) {
       }
 
       const base = `http://${ip}`;
-      const [coreR, healthR, versionR, stateR, sensorsR] = await Promise.allSettled([
+      const settled = await Promise.allSettled([
         _fetchCollectorJSON(`${base}:5025/api/core/health`, 6000),
         _fetchCollectorJSON(`${base}:5006/health`, 4000),
         _fetchCollectorJSON(`${base}:5006/version`, 4000),
         _fetchCollectorJSON(`${base}:5006/state`, 4000),
         _fetchCollectorJSON(`${base}:5006/sensors`, 4000),
       ]);
-      const core = coreR.status === 'fulfilled' ? coreR.value : null;
-      const hermesHealth = healthR.status === 'fulfilled' ? healthR.value : null;
-      const hermesVersion = versionR.status === 'fulfilled' && versionR.value && versionR.value.content
-        ? versionR.value.content.version : null;
-      const stateMap = stateR.status === 'fulfilled' ? _stateTopicMap(stateR.value) : {};
-
-      const ciInfo = (core && core.collector_info && core.collector_info.info) || {};
-      const devices = _groupComponents(ciInfo.components || (hermesHealth && hermesHealth.components) || {}, hermesHealth && hermesHealth.components);
-
-      const tc = core && core.task_config && core.task_config.id ? core.task_config : null;
-      const tpl = (tc && tc.template) || {};
-      const op = (tc && tc.operator) || {};
-      const task = tc ? {
-        id: tc.id,
-        name: tpl.ref_name || tpl.name || '未知任务',
-        state: tc.state || null,
-        hours: tc.hours != null ? tc.hours : null,
-        hoursCompleted: tc.hours_completed != null ? tc.hours_completed : 0,
-        percent: tc.hours ? Math.min(100, Math.round(((tc.hours_completed || 0) / tc.hours) * 100)) : null,
-        createTime: tc.create_time || null,
-        endTime: tc.end_time || null,
-        isTraining: !!tpl.is_training,
-        operator: {
-          name: op.name || op.localized_name || '未知',
-          level: op.level != null ? op.level : null,
-          email: op.email || null,
-          state: op.state || null,
-        },
-        steps: (tpl.steps && tpl.steps.payload) || [],
-        verbs: tpl.verbs || [],
-        objects: tpl.objects || [],
-      } : null;
-
-      const misc = (core && core.machine_config && core.machine_config.misc) || {};
-      const containers = Object.entries((core && core.containers) || {}).map(([name, status]) => ({ name, status }));
-
-      const _refused = r => {
-        if (r.status !== 'rejected') return false;
-        const cause = r.reason && r.reason.cause;
-        return !!(cause && (cause.code === 'ECONNREFUSED' || cause.code === 'ECONNRESET'));
-      };
-      const hermesAllDown = !hermesHealth && !hermesVersion && !Object.keys(stateMap).length;
-      const hermesOffline = hermesAllDown && _refused(healthR) && _refused(versionR) && _refused(stateR);
-
-      sendJSON(res, {
-        success: true,
+      // 即使本次选择直连采集器（refresh=1 或心跳暂时不可用），只要
+      // edge_hosts 里还有新鲜的代理快照，也一并带回机器状态，避免
+      // “实时刷新”时 FPS/Wuji 状态突然消失。
+      sendJSON(res, _composeLiveInfo(
         machineNumber,
-        source: 'live',
-        dataAgeSec: 0,
-        collectorName: misc.machine_id || null,
-        computerId: misc.computer_id || null,
-        importerVersion: (core && core.version) || null,
-        collectorVersion: hermesVersion,
-        channel: (core && core.channel) || null,
-        vstFps: (core && core.machine_config && core.machine_config.vst && core.machine_config.vst.fps) != null
-          ? core.machine_config.vst.fps : null,
-        sensors: sensorsR.status === 'fulfilled' && Array.isArray(sensorsR.value) ? sensorsR.value : null,
-        teleopDelay: {
-          left: stateMap['teleop/hand_left/delay'] != null ? stateMap['teleop/hand_left/delay'] : null,
-          right: stateMap['teleop/hand_right/delay'] != null ? stateMap['teleop/hand_right/delay'] : null,
-        },
-        questInfo: null,
-        devicesNet: null,
-        system: {
-          activity: (core && core.activity) || null,
-          collectorAlive: !!(core && core.is_collector_alive),
-          observerAlive: !!(core && core.is_observer_alive),
-          loggedIn: !!(core && core.is_logged_in),
-          idleTimeSecs: (core && core.idle_time_secs) != null ? core.idle_time_secs : null,
-          controlState: stateMap.control_state || ciInfo.status || null,
-          isRecording: !!stateMap.is_recording,
-          emergencyStopped: !!stateMap.is_emergency_stopped,
-          errorCount: stateMap.error_count != null ? stateMap.error_count : (ciInfo.errors ? ciInfo.errors.length : 0),
-        },
-        containers,
-        devices,
-        task,
-        degraded: ciInfo.degraded || (hermesHealth && hermesHealth.degraded) || [],
-        errors: ciInfo.errors || (hermesHealth && hermesHealth.errors) || [],
-
-        partial: {
-          importer: !core,
-          hermesOffline,
-          hermesFailed: hermesAllDown && !hermesOffline,
-        },
-      });
+        settled,
+        edgePresence && edgePresence.hostLastSeen
+          && Date.now() - new Date(edgePresence.hostLastSeen).getTime() < 90 * 1000
+          ? _edgeInfoFromPresence(edgePresence) : null,
+      ));
     } catch (e) {
       console.error('[Machine Info] Error:', e);
       sendJSON(res, { error: '服务器内部错误' }, 500);
+    }
+  }
+
+  async function handleGetMachineLive(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      res.write('event: connected\ndata: {"status":"ok"}\n\n');
+
+      let closed = false;
+      let fastBusy = false;
+      let slowBusy = false;
+      let coreR = null, versionR = null, stateR = null, sensorsR = null;
+      let edge = null;
+
+      const loadEdge = async () => {
+        try {
+          const presence = await loadEdgePresence();
+          const ep = presence && presence[machineNumber];
+          if (!ep) return;
+          edge = _edgeInfoFromPresence(ep);
+        } catch { }
+      };
+
+      const fetchSlow = async () => {
+        if (slowBusy) return;
+        slowBusy = true;
+        try {
+          const [c, v, s, sn] = await Promise.allSettled([
+            _fetchCollectorJSON(`http://${ip}:5025/api/core/health`, 6000),
+            _fetchCollectorJSON(`http://${ip}:5006/version`, 4000),
+            _fetchCollectorJSON(`http://${ip}:5006/state`, 4000),
+            _fetchCollectorJSON(`http://${ip}:5006/sensors`, 4000),
+          ]);
+          coreR = c; versionR = v; stateR = s; sensorsR = sn;
+        } catch { }
+        slowBusy = false;
+      };
+
+      const tick = async () => {
+        if (closed || fastBusy) return;
+        fastBusy = true;
+        try {
+          let healthR, coreRUse = coreR, edgeUse = edge;
+          const live = getEdgeLive ? getEdgeLive(machineNumber) : null;
+          if (live && live.core && live.hermesHealth && Date.now() - live.ts < 8000) {
+            healthR = { status: 'fulfilled', value: live.hermesHealth };
+            coreRUse = { status: 'fulfilled', value: live.core };
+            edgeUse = {
+              devicesNet: _mergeWujiDevices(live.devices || null, live.wuji || null)
+                || ((edge && edge.devicesNet) || null),
+              questInfo: live.quest ? {
+                netConnected: !!live.quest.connected,
+                serialNumber: live.quest.serialNumber || null,
+                adbStatus: live.quest.adbStatus || null,
+                batteryLevel: typeof live.quest.battery === 'object' && live.quest.battery
+                  ? (live.quest.battery.level != null ? live.quest.battery.level : null)
+                  : (typeof live.quest.battery === 'number' ? live.quest.battery : null),
+                batteryStatus: typeof live.quest.battery === 'object' && live.quest.battery ? (live.quest.battery.status || null) : null,
+                controllers: live.quest.controllers || null,
+              } : ((edge && edge.questInfo) || null),
+              cameraFps: live.cameraFps || (edge && edge.cameraFps) || null,
+              camerasFps: live.cameraFps && Array.isArray(live.cameraFps.cameras)
+                ? live.cameraFps.cameras
+                : ((live.cameras && Array.isArray(live.cameras)) ? live.cameras : ((edge && edge.cameras) || [])),
+              cameras: live.cameras && Array.isArray(live.cameras)
+                ? live.cameras
+                : ((edge && edge.cameras) || []),
+              encoderFps: live.encoderFps || (edge && edge.encoderFps) || null,
+              wuji: live.wuji || (edge && edge.wuji) || null,
+              handStream: live.handStream || (edge && edge.handStream) || null,
+            };
+          } else {
+            healthR = (await Promise.allSettled([
+              _fetchCollectorJSON(`http://${ip}:5006/health`, 3000),
+            ]))[0];
+          }
+          const body = _composeLiveInfo(machineNumber, [coreRUse, healthR, versionR, stateR, sensorsR], edgeUse);
+          if (!closed) res.write(`data: ${JSON.stringify(body)}\n\n`);
+        } catch { }
+        fastBusy = false;
+      };
+
+      const kill = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(slowTimer);
+        clearInterval(fastTimer);
+        clearTimeout(maxTimer);
+        try { res.end(); } catch { }
+      };
+      req.on('close', kill);
+
+      const slowTimer = setInterval(() => { loadEdge(); fetchSlow(); }, 10000);
+      const fastTimer = setInterval(() => { tick(); }, 2000);
+      const maxTimer = setTimeout(kill, 30 * 60 * 1000);
+
+      await loadEdge();
+      await fetchSlow();
+      if (!closed) await tick();
+    } catch (e) {
+      console.error('[Machine Live] Error:', e);
+      try { res.end(); } catch { }
     }
   }
 
@@ -1002,6 +1556,16 @@ module.exports = function createMachinesHandlers(deps) {
     handleMobileGetMachines,
     handleGetMachineStatus,
     handleGetMachineInfo,
+    handleGetMachineLive,
+    handleStopCollector,
+    handleStopExodus,
+    handleFixQuest,
+    handleDiagnoseHands,
+    handleDiagnoseProgress,
+    handleMachineConfig,
+    handleMachineCommands,
+    handleMachineCommand,
+    // handleArmControl,  // 机械臂状态切换暂未启用
     handleGetMachines,
     handleAddMachine,
     handleDeleteMachine,

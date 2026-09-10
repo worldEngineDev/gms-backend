@@ -1,0 +1,17 @@
+{
+  "remote.autoForwardPorts": true,
+  "remote.portsAttributes": {
+    "5173": {
+      "label": "Galio 前端 (Vite)",
+      "onAutoForward": "notify"
+    },
+    "8000": {
+      "label": "Galio 后端 (FastAPI)",
+      "onAutoForward": "notify"
+    },
+    "15433": {
+      "label": "Galio 临时 Postgres (演示用)",
+      "onAutoForward": "ignore"
+    }
+  }
+}

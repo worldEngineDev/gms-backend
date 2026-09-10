@@ -6,6 +6,8 @@ const execAsync = promisify(exec);
 class DeviceStatusDetector {
   constructor(options = {}) {
     this.machineNumber = options.machineNumber;
+    this.resolveContainer = typeof options.resolveContainer === 'function' ? options.resolveContainer : null;
+    this.execAsync = options.execAsync || execAsync;
 
     this.devices = {
 
@@ -79,54 +81,41 @@ class DeviceStatusDetector {
   async getGloveSNFromDockerLogs() {
     try {
       console.log(`[Device Detector] [DEBUG] 开始提取 SN 码...`);
-
-      const { stdout: allContainers } = await execAsync('docker ps -a --format "{{.Names}}"', { timeout: 5000 });
-      console.log(`[Device Detector] [DEBUG] 所有容器: ${allContainers.split('\n').length} 个`);
-
-      const containers = allContainers.split('\n').filter(c => c.trim() && (c.includes('mono') || c.includes('rdc')));
-      console.log(`[Device Detector] 找到 ${containers.length} 个 mono/rdc 容器: ${containers.join(', ')}`);
-
-      if (containers.length === 0) {
-        console.log(`[Device Detector] 未找到 mono/rdc 容器`);
+      let container = null;
+      if (this.resolveContainer) container = await this.resolveContainer('collector');
+      if (!container) {
+        console.log(`[Device Detector] 未找到运行中的采集容器`);
         return { left: null, right: null };
       }
-
+      console.log(`[Device Detector] 从采集容器 ${container} 提取 SN 码...`);
       const snCodes = { left: null, right: null };
+      let logs;
+      try {
+        ({ stdout: logs } = await this.execAsync(`docker logs --tail 200000 ${container}`, { timeout: 10000, maxBuffer: 10 * 1024 * 1024 }));
+      } catch (error) {
+        const text = [error.message, error.stdout, error.stderr].filter(Boolean).join('\n');
+        if (!this.resolveContainer || !/No such container|No such object|is not running|not found/i.test(text)) throw error;
+        container = await this.resolveContainer('collector', { force: true });
+        if (!container) return snCodes;
+        ({ stdout: logs } = await this.execAsync(`docker logs --tail 200000 ${container}`, { timeout: 10000, maxBuffer: 10 * 1024 * 1024 }));
+      }
 
-      for (const containerName of containers) {
-        console.log(`[Device Detector] 从容器 ${containerName} 提取 SN 码...`);
-
-        const { stdout: logs } = await execAsync(`docker logs ${containerName} 2>&1`, { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
-
-        const lines = logs.split('\n').filter(l => l.toLowerCase().includes('glove') && l.includes('sn='));
-        console.log(`[Device Detector] 找到 ${lines.length} 行包含手套 SN 的日志`);
-
-        if (lines.length === 0) continue;
-
-        for (let i = lines.length - 1; i >= 0; i--) {
-          const line = lines[i];
-
-          if (!snCodes.left) {
-            const leftMatch = line.match(/wuji_glove_l.*sn=(WG[0-9A-Z]+)/);
-            if (leftMatch) {
-              snCodes.left = leftMatch[1];
-              console.log(`[Device Detector] 左手 SN: ${snCodes.left}`);
-            }
-          }
-
-          if (!snCodes.right) {
-            const rightMatch = line.match(/wuji_glove_r.*sn=(WG[0-9A-Z]+)/);
-            if (rightMatch) {
-              snCodes.right = rightMatch[1];
-              console.log(`[Device Detector] 右手 SN: ${snCodes.right}`);
-            }
-          }
-
-          if (snCodes.left && snCodes.right) break;
+      const lines = String(logs || '').split('\n').filter(l => l.toLowerCase().includes('glove') && l.includes('sn='));
+      console.log(`[Device Detector] 找到 ${lines.length} 行包含手套 SN 的日志`);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!snCodes.left) {
+          const leftMatch = line.match(/wuji_glove_l.*sn=(WG[0-9A-Z]+)/);
+          if (leftMatch) snCodes.left = leftMatch[1];
         }
-
+        if (!snCodes.right) {
+          const rightMatch = line.match(/wuji_glove_r.*sn=(WG[0-9A-Z]+)/);
+          if (rightMatch) snCodes.right = rightMatch[1];
+        }
         if (snCodes.left && snCodes.right) break;
       }
+      if (snCodes.left) console.log(`[Device Detector] 左手 SN: ${snCodes.left}`);
+      if (snCodes.right) console.log(`[Device Detector] 右手 SN: ${snCodes.right}`);
 
       return snCodes;
     } catch (error) {
@@ -312,7 +301,7 @@ class DeviceStatusDetector {
       console.log('');
 
       const hasDexterous = status.dexterousHands.left.connected || status.dexterousHands.right.connected;
-      status.machineType = hasDexterous ? 'dexterous' : 'glove_only';
+      status.machineType = numMatch ? (parseInt(numMatch[1], 10) >= 100 ? 'dexterous' : 'glove_only') : (hasDexterous ? 'dexterous' : 'glove_only');
       console.log(`[Device Detector] 机器类型: ${status.machineType === 'dexterous' ? '灵巧手机器' : '纯手套机器'}`);
       console.log('');
     }
@@ -396,12 +385,14 @@ class DeviceStatusDetector {
       };
     }
 
-    if (this.lastStatus.machineType === 'dexterous') {
+    if (this.lastStatus.dexterousHands && this.lastStatus.dexterousHands.left && this.lastStatus.dexterousHands.right) {
       summary.dexterousHands = {
         left: this.lastStatus.dexterousHands.left.connected,
         right: this.lastStatus.dexterousHands.right.connected,
       };
+    }
 
+    if (this.lastStatus.machineType === 'dexterous') {
       summary.roboticArm = {
         connected: this.lastStatus.roboticArm?.connected || false,
       };

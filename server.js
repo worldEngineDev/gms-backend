@@ -1128,6 +1128,7 @@ function broadcastSSE(event, data) {
 //      ③ 前端只需一个 data_changed 监听器 + 1s 防抖统一 /api/sync。
 // 兼容：前端仍保留各 *_updated 监听器，未迁移的单事件广播点继续用 broadcastSSE。
 function broadcastChange(main, sideEffects = [], data = {}) {
+  if (!sideEffects) sideEffects = [];
   const allEvents = [`${main  }_updated`, ...sideEffects.map(s => `${s  }_updated`)];
   // 原子化失效所有相关缓存（在投递事件前完成，避免 worker 读到未失效的脏缓存）
   for (const evt of allEvents) {
@@ -3463,7 +3464,7 @@ async function startup() {
     });
     // 边缘代理域（每台机器上的 heartbeat-agent 上报心跳/设备观测事实）
     // 先于 machines 创建：machines 列表需注入 loadEdgePresence 合并主机在线状态
-    edge = createEdgeHandlers({ pool, redisClient, sendJSON, broadcastSSE });
+    edge = createEdgeHandlers({ pool, redisClient, sendJSON, broadcastSSE, broadcastChange, syncInventoryFromSN: _syncInventoryFromSN });
     edge.startSweeper();
     machines = createMachinesHandlers({
       pool, sendJSON,
@@ -3474,6 +3475,7 @@ async function startup() {
       _snToInvType,
       broadcastChange, broadcastSSE,
       loadEdgePresence: edge.loadEdgePresence,
+      getEdgeLive: require('./src/edge-live').getEdgeLive,
     });
     snRegistry = createSNRegistryHandlers({
       pool, sendJSON,
@@ -3496,6 +3498,10 @@ async function startup() {
     // 边缘代理故障类告警 → 自动创建技术支持工单（edge 先于 techSupport 创建，此处回填）
     if (edge && typeof edge.setTicketCreator === 'function') {
       edge.setTicketCreator(techSupport.createSystemTicket);
+    }
+    // 机器恢复录制 → 自动完成采集类自动工单（采集员自修后上机录制，自动闭环）
+    if (edge && typeof edge.setTicketCompleter === 'function') {
+      edge.setTicketCompleter(techSupport.autoCompleteCollectorTickets);
     }
 
     // PWA Web Push handlers
@@ -3654,6 +3660,17 @@ async function startup() {
     authRouter.register('/api/machines/production-history', 'GET',  machines.handleGetProductionHistory, { auth:'required' });
     // 机器综合信息（采集器系统健康/任务/活动状态，szx3-* 机器）
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/info$/, 'GET', machines.handleGetMachineInfo, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/live$/, 'GET', machines.handleGetMachineLive, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/stop-collector$/, 'POST', machines.handleStopCollector, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/stop-exodus$/, 'POST', machines.handleStopExodus, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/fix-quest$/, 'POST', machines.handleFixQuest, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/diagnose-hands$/, 'POST', machines.handleDiagnoseHands, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/diagnose-progress$/, 'GET', machines.handleDiagnoseProgress, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/machine-config$/, 'GET', machines.handleMachineConfig, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/machine-commands$/, 'GET', machines.handleMachineCommands, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/machine-command$/, 'POST', machines.handleMachineCommand, { auth:'required', body:true });
+    // 机械臂状态切换功能暂未启用（SDK 端口与 mono 采集器冲突），先注释掉路由
+    // authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/arm-control$/, 'POST', machines.handleArmControl, { auth:'required', body:true });
     authRouter.register('/api/edge/hosts', 'GET', edge.handleListHosts, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/shift-inspection$/,   'POST', handleSaveShiftInspection,   { auth:'required', body:true });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/shift-inspections$/,  'GET',  handleGetShiftInspections,   { auth:'required' });
@@ -3964,6 +3981,47 @@ async function startup() {
     // back through /api/auth/verify.
     realtime.init(server, { isConnected: () => redisClient && redisClient.isReady, subscribe: async (ch, fn) => { if (redisSub) await redisSub.subscribe(ch, fn); }, SSE_CHANNEL: 'sse:all' }, { validateToken });
 
+    // 边缘 agent WebSocket 长连接：每 ~2s 推送采集器原始数据到内存缓存（/live SSE 流消费）
+    // 断开 10s 仍未重连 → 标记离线并广播（比 30s HTTP 心跳超时感知快得多）
+    const { WebSocketServer } = require('ws');
+    const edgeLive = require('./src/edge-live');
+    const edgeWss = new WebSocketServer({ server, path: '/api/edge/ws' });
+    const wsOfflineTimers = new Map();
+    edgeWss.on('connection', (ws, req) => {
+      try {
+        const u = new URL(req.url, 'http://localhost');
+        const token = u.searchParams.get('token') || '';
+        const machineNumber = String(u.searchParams.get('machine') || '').trim().toLowerCase();
+        if (!machineNumber || token !== (process.env.EDGE_TOKEN || '')) { ws.close(4001, 'unauthorized'); return; }
+        ws.edgeMachine = machineNumber;
+        edgeLive.markEdgeWsConnected(machineNumber, true);
+        const t = wsOfflineTimers.get(machineNumber);
+        if (t) { clearTimeout(t); wsOfflineTimers.delete(machineNumber); }
+        console.log(`[EDGE-WS] ${machineNumber} 已连接`);
+        ws.on('message', (raw) => {
+          try {
+            const msg = JSON.parse(raw.toString());
+            if (msg.type === 'fast' && msg.data) edgeLive.setEdgeLive(machineNumber, msg.data);
+          } catch { }
+        });
+        ws.on('close', () => {
+          edgeLive.markEdgeWsConnected(machineNumber, false);
+          console.log(`[EDGE-WS] ${machineNumber} 已断开，10s 宽限后判离线`);
+          const old = wsOfflineTimers.get(machineNumber);
+          if (old) clearTimeout(old);
+          wsOfflineTimers.set(machineNumber, setTimeout(async () => {
+            wsOfflineTimers.delete(machineNumber);
+            try {
+              await pool.execute("UPDATE edge_hosts SET status = 'offline', updatedAt = ? WHERE machineNumber = ?", [new Date().toISOString(), machineNumber]);
+              try { if (redisClient && redisClient.del) await redisClient.del(`edge:presence:${machineNumber}`); } catch { }
+              try { broadcastSSE('machine_presence_updated', { machineNumber, offline: true }); } catch { }
+              console.log(`[EDGE-WS] ${machineNumber} 判定离线`);
+            } catch (e) { console.error('[EDGE-WS] 离线落库失败:', e.message); }
+          }, 10000));
+        });
+      } catch (e) { console.error('[EDGE-WS] 连接处理失败:', e.message); try { ws.close(); } catch { } }
+    });
+
     // Feishu sync initialized lazily on first tech_support operation
   } catch (e) {
     console.error('[FATAL] Database initialization failed:', e.message);
@@ -4162,12 +4220,13 @@ setInterval(() => {
 const staticCache = new Map(); // path → { data, gzipped, contentType, ts }
 
 function getStaticFile(filePath, contentType, cacheKey) {
-  const cached = staticCache.get(cacheKey);
-  if (cached && (Date.now() - cached.ts) < 3600000) return cached; // 1h TTL
   try {
+    const mtimeMs = fs.statSync(filePath).mtimeMs;
+    const cached = staticCache.get(cacheKey);
+    if (cached && cached.mtimeMs === mtimeMs) return cached;
     const data = fs.readFileSync(filePath);
     const gzipped = zlib.gzipSync(data);
-    const entry = { data, gzipped, contentType, ts: Date.now() };
+    const entry = { data, gzipped, contentType, ts: Date.now(), mtimeMs };
     staticCache.set(cacheKey, entry);
     return entry;
   } catch { return null; }

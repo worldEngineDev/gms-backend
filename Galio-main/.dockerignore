@@ -1,0 +1,14 @@
+# 没有这个文件的话，COPY backend/ ./ 之类的指令会把宿主机本地跑 uv sync/npm install
+# 产生的 .venv、node_modules 一起拷进镜像，把 Dockerfile 里 RUN uv sync 刚装好的、
+# 指向容器自身 Python 的虚拟环境直接覆盖掉——曾经因为这个排查了很久一个奇怪的
+# "容器里的 python 软链接指向宿主机路径"的假象，根子就是这里。
+
+.git/
+**/__pycache__/
+**/*.pyc
+backend/.venv/
+backend/.pytest_cache/
+backend/.ruff_cache/
+frontend/node_modules/
+frontend/dist/
+secrets/

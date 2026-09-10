@@ -27,10 +27,18 @@ const TICKET_RETRY_MS = 10 * 60 * 1000;
 
 module.exports = function createEdgeHandlers(deps) {
   const { pool, redisClient, sendJSON, broadcastSSE } = deps;
+  const broadcastChange = typeof deps.broadcastChange === 'function' ? deps.broadcastChange : null;
+  const syncInventoryFromSN = typeof deps.syncInventoryFromSN === 'function' ? deps.syncInventoryFromSN : null;
 
   let _createSystemTicket = null;
   function setTicketCreator(fn) {
     _createSystemTicket = typeof fn === 'function' ? fn : null;
+  }
+
+  // 录制恢复自动关单（由 tech-support 域注入）：机器开始录制时自动完成采集类自动工单
+  let _autoTicketCompleter = null;
+  function setTicketCompleter(fn) {
+    _autoTicketCompleter = typeof fn === 'function' ? fn : null;
   }
 
   function _ticketEnabledCodes() {
@@ -71,9 +79,168 @@ module.exports = function createEdgeHandlers(deps) {
     try { await redisClient.del(`edge:presence:${machineNumber}`); } catch {}
   }
 
+  // 依据库存 equipmentType（缺失时按 SN 前缀 WH=灵巧手，其余=手套）归类
+  function _snKind(recOrSn, equipmentType) {
+    const et = equipmentType !== undefined ? equipmentType : (recOrSn && recOrSn.equipmentType);
+    const sn = typeof recOrSn === 'string' ? recOrSn : (recOrSn && recOrSn.snCode) || '';
+    if (et === 'dexterous_hand' || (!et && String(sn).startsWith('WH'))) return 'dexterous_hand';
+    return 'glove';
+  }
+
+  // 事务内按在库手套重算机器在线状态（在线规则以左/右手手套为准，灵巧手不参与）
+  async function _cascadeMachineStatusByGloves(conn, machineNumber, now) {
+    if (!machineNumber) return;
+    const [mRows] = await conn.execute(
+      'SELECT id, data FROM machines WHERE machineNumber = ? ORDER BY updatedAt DESC, id DESC LIMIT 1 FOR UPDATE',
+      [machineNumber]
+    );
+    if (mRows.length === 0) return;
+    let d;
+    try { d = JSON.parse(mRows[0].data); } catch { return; }
+    if (d.status === 'waiting_repair' || d.status === 'repairing') return;
+    const [cnt] = await conn.execute(
+      "SELECT handType FROM sn_registry WHERE machineNumber = ? AND status = 'in_use' AND (equipmentType = 'glove' OR snCode LIKE 'WG%')",
+      [machineNumber]
+    );
+    const hands = new Set(cnt.map(c => c.handType));
+    let next = d.status;
+    if (hands.has('left') && hands.has('right')) next = 'online';
+    else if (hands.has('left') || hands.has('right')) next = 'partial';
+    else next = 'offline';
+    if (next === d.status) return;
+    d.status = next;
+    d.updatedAt = now;
+    await conn.execute(
+      "INSERT INTO machines (id, data, machineNumber, status, updatedAt) VALUES (?, ?, ?, ?, ?) " +
+      "ON DUPLICATE KEY UPDATE data = VALUES(data), status = VALUES(status), updatedAt = VALUES(updatedAt)",
+      [mRows[0].id, JSON.stringify(d), d.machineNumber, d.status, d.updatedAt]
+    );
+    console.log('[EDGE][自动绑定] ' + machineNumber + ' 机器状态联动 -> ' + next);
+  }
+
+  // 心跳自动识别上架：库存匹配到且物理连在本机的手套/灵巧手自动绑定到当前机器；
+  // 已绑其它机器的自动改绑到本机（以实际物理连接为准）。不自动解绑（瞬断不抖动）。
+  // 同槽位替换：当已登记的新设备占用本机某槽位时，自动下架该槽位原绑旧设备（一个槽位只允许一台设备）。
+  const AUTO_BIND_USABLE = new Set(["available", "repaired"]);
+  const AUTO_BIND_BLOCKED = new Set(["damaged","transferred","shipped","scrapped","in_repair","repairing","waiting_repair"]);
+
+  async function autoBindObserved(machineNumber, devices) {
+    const out = [];
+    const gloves = (devices && devices.gloves) || {};
+    const dexHands = (devices && devices.dexterousHands) || {};
+    const list = [];
+    for (const hand of ['left', 'right']) {
+      const g = gloves[hand];
+      if (g && g.connected && g.snCode) list.push({ kind: 'glove', hand, snCode: String(g.snCode) });
+      const h = dexHands && dexHands[hand];
+      if (h && h.connected && h.snCode) list.push({ kind: 'dexterous_hand', hand, snCode: String(h.snCode) });
+    }
+    if (!list.length) return out;
+
+    const conn = await pool.getConnection();
+    let changed = false;
+    try {
+      await conn.beginTransaction();
+      const sns = [...new Set(list.map(o => o.snCode))];
+      const ph = sns.map(() => '?').join(',');
+      const [rows] = await conn.execute(
+        'SELECT snCode, equipmentType, handType, status, machineNumber FROM sn_registry WHERE snCode IN (' + ph + ') FOR UPDATE',
+        sns
+      );
+      const map = Object.create(null);
+      for (const r of rows) map[r.snCode] = r;
+
+      const now = new Date().toISOString();
+      const oldMachines = new Set();
+
+      for (const o of list) {
+        const rec = map[o.snCode];
+        if (!rec) continue;
+        if (rec.handType && rec.handType !== o.hand) continue;
+        const equipmentType = rec.equipmentType || o.kind;
+
+        if (!AUTO_BIND_BLOCKED.has(rec.status) && !(rec.status === 'in_use' && (rec.machineNumber || '') === machineNumber)) {
+          let action = null;
+          if (rec.status === 'in_use' && rec.machineNumber && rec.machineNumber !== machineNumber) {
+            action = 'rebind';
+            oldMachines.add(rec.machineNumber);
+          } else if (AUTO_BIND_USABLE.has(rec.status) || !rec.machineNumber) {
+            action = 'bind';
+          }
+          if (action) {
+            await conn.execute(
+              'UPDATE sn_registry SET equipmentType=?, handType=?, status=?, machineNumber=?, updatedAt=? WHERE snCode=?',
+              [equipmentType, o.hand, 'in_use', machineNumber, now, o.snCode]
+            );
+            const hid = 'h-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + '-' + o.snCode.slice(-6);
+            const reason = action === 'rebind'
+              ? '心跳检测到设备实际连接在机器' + machineNumber + '，由机器' + rec.machineNumber + '自动改绑'
+              : '心跳自动识别设备连接并上架到当前机器';
+            await conn.execute(
+              'INSERT INTO sn_status_history (id, snCode, oldStatus, newStatus, operator, reason, machineNumber, createdAt) VALUES (?,?,?,?,?,?,?,?)',
+              [hid, o.snCode, rec.status || 'available', 'in_use', 'edge-auto', reason, machineNumber, now]
+            );
+            changed = true;
+            out.push({ snCode: o.snCode, kind: o.kind, hand: o.hand, action, fromMachine: action === 'rebind' ? rec.machineNumber : null });
+          }
+        }
+
+        // 同槽位替换清理：本机该槽位被当前已登记设备占用，释放槽位上其他在用旧设备
+        const [staleRows] = await conn.execute(
+          "SELECT snCode FROM sn_registry WHERE machineNumber = ? AND status = 'in_use' AND equipmentType = ? AND handType = ? AND snCode <> ? FOR UPDATE",
+          [machineNumber, equipmentType, o.hand, o.snCode]
+        );
+        for (const s of staleRows) {
+          await conn.execute(
+            "UPDATE sn_registry SET status = 'available', machineNumber = '', updatedAt = ? WHERE snCode = ?",
+            [now, s.snCode]
+          );
+          const sid = 'h-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + '-' + s.snCode.slice(-6);
+          await conn.execute(
+            'INSERT INTO sn_status_history (id, snCode, oldStatus, newStatus, operator, reason, machineNumber, createdAt) VALUES (?,?,?,?,?,?,?,?)',
+            [sid, s.snCode, 'in_use', 'available', 'edge-auto', '同槽位检测到新设备 ' + o.snCode + '，旧设备自动下架', machineNumber, now]
+          );
+          changed = true;
+          out.push({ snCode: s.snCode, kind: o.kind, hand: o.hand, action: 'release', replacedBy: o.snCode });
+        }
+      }
+
+      if (!changed) { await conn.rollback(); return out; }
+
+      await _cascadeMachineStatusByGloves(conn, machineNumber, now);
+      for (const m of oldMachines) {
+        if (m && m !== machineNumber) await _cascadeMachineStatusByGloves(conn, m, now);
+      }
+      if (syncInventoryFromSN) await syncInventoryFromSN(conn);
+      await conn.commit();
+    } catch (e) {
+      try { await conn.rollback(); } catch {}
+      console.error('[EDGE][自动绑定] 异常:', e.message);
+      return out;
+    } finally {
+      try { conn.release(); } catch {}
+    }
+
+    for (const r of out) {
+      const kindLabel = r.kind === 'dexterous_hand' ? '灵巧手' : '手套';
+      const handLabel = r.hand === 'left' ? '左手' : '右手';
+      let line;
+      if (r.action === 'release') {
+        line = '[EDGE][自动绑定] ' + machineNumber + ' 自动下架 ' + kindLabel + handLabel + ' ' + r.snCode + '（被 ' + r.replacedBy + ' 取代）';
+      } else {
+        line = '[EDGE][自动绑定] ' + machineNumber + ' ' + (r.action === 'rebind' ? '自动改绑' : '自动上架') + ' ' + kindLabel + handLabel + ' ' + r.snCode + (r.fromMachine ? '（原绑 ' + r.fromMachine + '）' : '');
+      }
+      console.log(line);
+    }
+    if (changed && broadcastChange) {
+      try { broadcastChange('sn_registry', ['inventory', 'machines']); } catch {}
+    }
+    return out;
+  }
   async function reconcile(machineNumber, devices, collector) {
     const alerts = [];
     const gloves = (devices && devices.gloves) || {};
+    const dexHands = (devices && devices.dexterousHands) || {};
     const observed = {
       left: {
         connected: !!(gloves.left && gloves.left.connected),
@@ -87,54 +254,65 @@ module.exports = function createEdgeHandlers(deps) {
       },
     };
 
-    const [dbRows] = await pool.execute(
-      "SELECT snCode, handType FROM sn_registry WHERE machineNumber = ? AND status = 'in_use'",
-      [machineNumber]
-    );
-    const dbByHand = { left: null, right: null };
-    for (const r of dbRows) {
-      if (r.handType === 'left' || r.handType === 'right') dbByHand[r.handType] = r.snCode;
+    // 统一观测项：手套(WG) + 灵巧手(WH2)，分别按左右手对账
+    const KIND_LABEL = { glove: '手套', dexterous_hand: '灵巧手' };
+    const items = [];
+    for (const hand of ['left', 'right']) {
+      const g = gloves[hand];
+      items.push({ kind: 'glove', hand, connected: !!(g && g.connected), snCode: (g && g.snCode) || null });
+      const h = dexHands && dexHands[hand];
+      if (h) items.push({ kind: 'dexterous_hand', hand, connected: !!h.connected, snCode: h.snCode || null });
     }
 
-    const observedSNs = [observed.left.snCode, observed.right.snCode].filter(Boolean);
+    const [dbRows] = await pool.execute(
+      "SELECT snCode, handType, equipmentType FROM sn_registry WHERE machineNumber = ? AND status = 'in_use'",
+      [machineNumber]
+    );
+    const dbBound = { glove: { left: null, right: null }, dexterous_hand: { left: null, right: null } };
+    for (const r of dbRows) {
+      if (r.handType !== 'left' && r.handType !== 'right') continue;
+      dbBound[_snKind(r)][r.handType] = r.snCode;
+    }
+
+    const observedSNs = [...new Set(items.map(i => i.snCode).filter(Boolean))];
     const snMap = Object.create(null);
     if (observedSNs.length) {
       const placeholders = observedSNs.map(() => '?').join(',');
       const [rows] = await pool.execute(
-        `SELECT snCode, handType, status, machineNumber FROM sn_registry WHERE snCode IN (${placeholders})`,
+        `SELECT snCode, equipmentType, handType, status, machineNumber FROM sn_registry WHERE snCode IN (${placeholders})`,
         observedSNs
       );
       for (const r of rows) snMap[r.snCode] = r;
     }
 
-    const UNUSABLE = new Set(['damaged', 'transferred', 'shipped', 'repairing', 'waiting_repair', 'scrapped']);
+    const UNUSABLE = new Set(['damaged', 'transferred', 'shipped', 'repairing', 'waiting_repair', 'scrapped', 'in_repair']);
 
-    for (const hand of ['left', 'right']) {
-      const obs = observed[hand];
-      const handLabel = hand === 'left' ? '左手' : '右手';
+    for (const it of items) {
+      const handLabel = it.hand === 'left' ? '左手' : '右手';
+      const base = `${KIND_LABEL[it.kind]}${handLabel}`;
 
-      if (obs.connected) {
-        if (!obs.snCode) {
-          alerts.push({ level: 'info', code: 'glove_no_sn', hand, snCode: null, message: `${handLabel}套已连接但未能识别 SN 码` });
+      if (it.connected) {
+        if (!it.snCode) {
+          alerts.push({ level: 'info', code: 'glove_no_sn', kind: it.kind, hand: it.hand, snCode: null, message: `${base}已连接但未能识别 SN 码` });
         } else {
-          const rec = snMap[obs.snCode];
+          const rec = snMap[it.snCode];
           if (!rec) {
-            alerts.push({ level: 'error', code: 'unregistered_sn', hand, snCode: obs.snCode, message: `${handLabel}套 SN ${obs.snCode} 未在 SN 注册表登记` });
+            alerts.push({ level: 'error', code: 'unregistered_sn', kind: it.kind, hand: it.hand, snCode: it.snCode, message: `${base} SN ${it.snCode} 未在 SN 注册表登记` });
           } else {
-            if (rec.handType && rec.handType !== hand) {
-              alerts.push({ level: 'error', code: 'hand_mismatch', hand, snCode: obs.snCode, message: `${handLabel}网口检测到 SN ${obs.snCode}，注册表记录为${rec.handType === 'left' ? '左' : '右'}手手套，疑似接反` });
+            if (rec.handType && rec.handType !== it.hand) {
+              alerts.push({ level: 'error', code: 'hand_mismatch', kind: it.kind, hand: it.hand, snCode: it.snCode, message: `${handLabel}网口检测到 ${KIND_LABEL[it.kind]} SN ${it.snCode}，注册表记录为${rec.handType === 'left' ? '左' : '右'}手设备，疑似接反` });
             }
             if (UNUSABLE.has(rec.status)) {
-              alerts.push({ level: 'error', code: 'sn_unusable', hand, snCode: obs.snCode, message: `${handLabel}套 SN ${obs.snCode} 当前状态为 ${rec.status}，不可投入使用` });
+              alerts.push({ level: 'error', code: 'sn_unusable', kind: it.kind, hand: it.hand, snCode: it.snCode, message: `${base} SN ${it.snCode} 当前状态为 ${rec.status}，不可投入使用` });
             } else if (rec.status === 'in_use' && rec.machineNumber && rec.machineNumber !== machineNumber) {
-              alerts.push({ level: 'error', code: 'sn_bound_elsewhere', hand, snCode: obs.snCode, message: `${handLabel}套 SN ${obs.snCode} 已绑定在机器 ${rec.machineNumber}` });
+              alerts.push({ level: 'error', code: 'sn_bound_elsewhere', kind: it.kind, hand: it.hand, snCode: it.snCode, message: `${base} SN ${it.snCode} 已绑定在机器 ${rec.machineNumber}` });
             }
           }
         }
       }
 
-      if (dbByHand[hand] && !obs.connected) {
-        alerts.push({ level: 'warn', code: 'bound_but_disconnected', hand, snCode: dbByHand[hand], message: `系统记录 ${handLabel}套 ${dbByHand[hand]} 绑定中，但未检测到设备连接` });
+      if (dbBound[it.kind][it.hand] && !it.connected) {
+        alerts.push({ level: 'warn', code: 'bound_but_disconnected', kind: it.kind, hand: it.hand, snCode: dbBound[it.kind][it.hand], message: `系统记录 ${base} ${dbBound[it.kind][it.hand]} 绑定中，但未检测到设备连接` });
       }
     }
 
@@ -153,7 +331,30 @@ module.exports = function createEdgeHandlers(deps) {
       const degraded = Array.isArray(health.degraded) ? health.degraded : [];
       const healthFresh = !hermes.endpointStatus || hermes.endpointStatus.health !== false;
       if (hermes.reachable !== false && healthFresh && (degraded.length || health.allConnected === false)) {
-        alerts.push({ level: 'error', code: 'collector_degraded', components: degraded, message: `采集组件处于降级状态${degraded.length ? `：${degraded.join('、')}` : ''}` });
+        // 组件降级 → 友好中文描述（gello/ 前缀才是左右手套在 Hermes health 中的实际 key）
+        const DEVICE_NAMES = {
+          'robot/wuji_glove_l': '设备手套L', 'robot/wuji_glove_r': '设备手套R',
+          'gello/wuji_glove_l': '设备手套L', 'gello/wuji_glove_r': '设备手套R',
+          'robot/wuji_hand_l': '设备灵巧手L', 'robot/wuji_hand_r': '设备灵巧手R',
+          'quest/overlay': '设备Quest', 'gello/quest_controller': '设备Quest手柄',
+          'robot/marvin': '设备机械臂',
+        };
+        const CAMERA_NAMES = {
+          'vst_left': '头显左眼相机', 'vst_right': '头显右眼相机',
+          'wrist_left': '左手腕相机', 'wrist_right': '右手腕相机',
+          'overlay': '合成画面相机',
+        };
+        const mapped = [];
+        for (const k of degraded) {
+          let name = DEVICE_NAMES[k];
+          if (!name) {
+            const m = /^camera\/(.+)$/.exec(k);
+            if (m) name = CAMERA_NAMES[m[1]] || `相机${m[1]}`;
+          }
+          if (name && !mapped.includes(name)) mapped.push(name);
+        }
+        const desc = mapped.length ? `${mapped.join('、')}连接断开` : '采集组件降级';
+        alerts.push({ level: 'error', code: 'collector_degraded', components: degraded, message: desc });
       }
       const state = hermes.state || {};
       const stateFresh = !hermes.endpointStatus || hermes.endpointStatus.state !== false;
@@ -203,7 +404,9 @@ module.exports = function createEdgeHandlers(deps) {
       rightDexterous: !!(devices.dexterousHands && devices.dexterousHands.right && devices.dexterousHands.right.connected),
       roboticArm: !!(devices.roboticArm && devices.roboticArm.connected),
       quest: !!(heartbeatPayload.quest && heartbeatPayload.quest.connected),
-      questBattery: (heartbeatPayload.quest && heartbeatPayload.quest.battery) || null,
+      questBattery: (heartbeatPayload.quest && heartbeatPayload.quest.battery)
+        ? (typeof heartbeatPayload.quest.battery === 'object' ? heartbeatPayload.quest.battery.level : heartbeatPayload.quest.battery)
+        : null,
     };
 
     for (const a of alerts) {
@@ -354,6 +557,11 @@ module.exports = function createEdgeHandlers(deps) {
     };
     let alerts = [];
     try {
+      await autoBindObserved(machineNumber, b.devices || {});
+    } catch (e) {
+      console.error("[EDGE] 自动识别上架异常:", e.message);
+    }
+    try {
       const r = await reconcile(machineNumber, b.devices || {}, b);
       observed = r.observed;
       alerts = r.alerts;
@@ -379,6 +587,22 @@ module.exports = function createEdgeHandlers(deps) {
       console.error('[EDGE] 自动工单流程异常:', e.message);
     }
 
+    // 录制恢复 → 自动完成采集类自动工单（采集员自修后重新录制，无需运维人工关单）
+    // 边沿触发：仅在上一次心跳"未录制"、本次"开始录制"时执行，避免每次心跳都查库
+    try {
+      const prevHermes = prevData && prevData.hermes;
+      const prevRecording = !!(prevHermes && prevHermes.state && prevHermes.state.isRecording === true);
+      const nowRecording = !!(b.hermes && b.hermes.state && b.hermes.state.isRecording === true);
+      if (nowRecording && !prevRecording && typeof _autoTicketCompleter === 'function') {
+        const r = await _autoTicketCompleter(machineNumber);
+        if (r && r.closed > 0) {
+          console.log(`[EDGE] ${machineNumber} 开始录制，自动完成 ${r.closed} 张采集故障工单`);
+        }
+      }
+    } catch (e) {
+      console.error('[EDGE] 录制恢复自动关单异常:', e.message);
+    }
+
     const data = {
       observed,
       alerts,
@@ -387,7 +611,11 @@ module.exports = function createEdgeHandlers(deps) {
       quest: b.quest || null,
       machineType: b.machineType || null,
       cameraFps: b.cameraFps || null,
+      // 兼容首次采样尚未产生 cameraFps 的情况；三路设备列表仍保留在机器状态。
+      cameras: Array.isArray(b.cameras) ? b.cameras : [],
+      encoderFps: b.encoderFps || null,
       handStream: b.handStream || null,
+      wuji: b.wuji || null,
       host: b.host || {},
       importer: b.importer || null,
       hermes: b.hermes || null,
@@ -478,6 +706,13 @@ module.exports = function createEdgeHandlers(deps) {
         alerts: Array.isArray(d.alerts) ? d.alerts : [],
         quest: d.quest || null,
         machineType: d.machineType || null,
+        cameraFps: d.cameraFps || null,
+        camerasFps: d.cameraFps && Array.isArray(d.cameraFps.cameras) ? d.cameraFps.cameras : (Array.isArray(d.cameras) ? d.cameras : []),
+        cameras: Array.isArray(d.cameras) ? d.cameras : [],
+        encoderFps: d.encoderFps || null,
+        wuji: d.wuji || null,
+        devicesNet: d.devices || null,
+        handStream: d.handStream || null,
         host: d.host || {},
         importer: d.importer || null,
         hermes: d.hermes || null,
@@ -509,8 +744,12 @@ module.exports = function createEdgeHandlers(deps) {
           edgeAlerts: Array.isArray(d.alerts) ? d.alerts : [],
           edgeQuest: d.quest || null,
           edgeDevices: d.devices || null,
+          machineType: d.machineType || null,
           edgeCameraFps: d.cameraFps || null,
+          edgeCameras: Array.isArray(d.cameras) ? d.cameras : [],
+          edgeEncoderFps: d.encoderFps || null,
           edgeHandStream: d.handStream || null,
+          edgeWuji: d.wuji || null,
           importer: d.importer || null,
           hermes: d.hermes || null,
         };
@@ -551,5 +790,6 @@ module.exports = function createEdgeHandlers(deps) {
     loadEdgePresence,
     startSweeper,
     setTicketCreator,
+    setTicketCompleter,
   };
 };
