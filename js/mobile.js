@@ -4058,7 +4058,7 @@
         hasQuest = numM && parseInt(numM[1], 10) >= 100;
       }
       var items = '';
-      if (hasQuest) items += '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-diag" onclick="M._msDiagnoseHands(\''+self._esc(num)+'\')">&#128269; 灵巧手检测（故障/温度/电压/通信）</button>'+
+      if (hasQuest) items += '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-diag" onclick="M._msChooseDiagnoseHands(\''+self._esc(num)+'\')">&#128269; 灵巧手检测（故障/温度/电压/通信）</button>'+
         '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-fix" onclick="M._msSheetCmd(\'fix\',\''+self._esc(num)+'\')">修复 Quest 连接（授权相机并重启应用）</button>'+
         '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-cfg" onclick="M._msMachineConfig(\''+self._esc(num)+'\')">&#128221; 查看机器配置</button>';
         // 机械臂状态切换功能暂未启用，入口先隐藏
@@ -4350,14 +4350,34 @@
       }
     },
     */ // 机械臂状态切换方法块注释结束
-    async _msDiagnoseHands(num) {
+    _msChooseDiagnoseHands(num) {
       this._msCloseSheet();
       var self = this;
+      var n = self._esc(num);
+      var choose = function(scope) {
+        return 'M._msDiagnoseHands(\''+n+'\',\''+scope+'\')';
+      };
+      self.openModal('<div class="m-modal-header"><div class="m-modal-title">'+n+' · 灵巧手检测</div><button class="m-modal-close" onclick="M.closeModal()">×</button></div>'+
+        '<div class="m-form-section"><div class="m-field-label" style="margin-bottom:10px;">检测范围</div>'+
+        '<div style="display:flex;flex-direction:column;gap:8px;">'+
+        '<button class="m-ms-act" style="width:100%;" onclick="'+choose('all')+'">全部灵巧手</button>'+
+        '<button class="m-ms-act" style="width:100%;" onclick="'+choose('left')+'">仅左手</button>'+
+        '<button class="m-ms-act" style="width:100%;" onclick="'+choose('right')+'">仅右手</button></div></div>'+
+        '<div class="m-btn-row"><button class="m-btn m-btn-outline m-btn-block" onclick="M.closeModal()">取消</button></div>');
+    },
+    async _msDiagnoseHands(num, side) {
+      if (side !== 'left' && side !== 'right' && side !== 'all') {
+        this._msChooseDiagnoseHands(num);
+        return;
+      }
+      this._msCloseSheet();
+      var self = this;
+      var scopeLabel = side === 'left' ? '仅左手' : side === 'right' ? '仅右手' : '全部灵巧手';
       var render = function(body, loading) {
-        self.openModal('<div class="m-modal-header"><div class="m-modal-title">'+self._esc(num)+' · 灵巧手检测</div>'+
+        self.openModal('<div class="m-modal-header"><div class="m-modal-title">'+self._esc(num)+' · 灵巧手检测 · '+scopeLabel+'</div>'+
           '<button class="m-modal-close" onclick="M.closeModal()">×</button></div>'+
           '<div style="max-height:60vh;overflow-y:auto;padding:0 14px;">'+body+'</div>'+
-          '<div style="padding:0 14px;"><div class="m-ms-info-actions"><button class="m-ms-act" id="m-diag-retry" '+(loading?'disabled':'onclick="M._msDiagnoseHands(\''+self._esc(num)+'\')"')+'>'+(loading?'检测中... 约需 1 分钟':'&#8635; 重新检测')+'</button></div></div>');
+          '<div style="padding:0 14px;"><div class="m-ms-info-actions"><button class="m-ms-act" id="m-diag-retry" '+(loading?'disabled':'onclick="M._msDiagnoseHands(\''+self._esc(num)+'\',\''+side+'\')"')+'>'+(loading?'检测中... 约需 1 分钟':'&#8635; 重新检测')+'</button></div></div>');
       };
       // —— 进度条模式：先展示进度，轮询 agent 实时状态，检测完成后再渲染结果 ——
       var progHtml = function(pct, msg, sub) {
@@ -4393,7 +4413,7 @@
       var stopPoll = function() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } };
       var pollOnce = async function() {
         try {
-          var pr = await API.diagnoseProgress(num);
+          var pr = await API.diagnoseProgress(num, side);
           if (!pr || !pr.success || !pr.progress) return;
           var p = pr.progress;
           var pct;
@@ -4402,8 +4422,8 @@
           else if (p.phase === 'done') pct = 98;
           else if (p.phase === 'error') pct = 96;
           else pct = 6;
-          var side = sideOf(p.sn) || '';
-          var sub = side ? (side + (p.sn ? '　'+p.sn : '')) : (p.sn || '');
+          var snSide = sideOf(p.sn) || '';
+          var sub = snSide ? (snSide + (p.sn ? '　'+p.sn : '')) : (p.sn || '');
           var keep = setProgress(pct, p.message || '', sub);
           if (!keep || p.running === false) stopPoll();
         } catch (e) { }
@@ -4412,7 +4432,7 @@
       pollOnce();
       var r;
       try {
-        r = await API.diagnoseHands(num);
+        r = await API.diagnoseHands(num, side);
       } catch (e) {
         r = { error: (e && e.message) || '检测失败' };
       }
