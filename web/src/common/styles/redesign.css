@@ -1,0 +1,134 @@
+/* GMS visual refresh v1
+   This file is intentionally separate from global.css so the redesign can
+   be reverted by removing one import without touching page behavior. */
+:root {
+  --gms-ink: #152238;
+  --gms-muted: #64748b;
+  --gms-faint: #94a3b8;
+  --gms-line: #dce5ec;
+  --gms-bg: #f3f6f8;
+  --gms-surface: #ffffff;
+  --gms-navy: #153a5b;
+  --gms-navy-2: #214d73;
+  --gms-coral: #e66a4e;
+  --gms-mint: #16866b;
+  --gms-shadow: 0 8px 28px rgba(21, 58, 91, .08);
+  --gms-shadow-sm: 0 2px 10px rgba(21, 58, 91, .06);
+}
+
+body { background: var(--gms-bg); color: var(--gms-ink); }
+
+/* Shell */
+.gms-shell { background: var(--gms-bg) !important; }
+.gms-shell .ant-layout-sider {
+  background: var(--gms-surface) !important;
+  border-right: 1px solid var(--gms-line) !important;
+}
+.gms-shell .ant-layout-header {
+  background: rgba(255,255,255,.92) !important;
+  border-bottom: 1px solid var(--gms-line) !important;
+  box-shadow: 0 2px 14px rgba(21,58,91,.05);
+  backdrop-filter: blur(12px);
+}
+.gms-shell .ant-layout-content { background: var(--gms-bg) !important; }
+.gms-shell-main { min-width: 0; }
+.gms-shell-header { position: sticky; top: 0; z-index: 5; }
+.gms-shell-header > .ant-space,
+.gms-shell-header > .ant-flex { min-width: 0; }
+.gms-shell-header .ant-space:last-child,
+.gms-shell-header .ant-flex:last-child { min-width: 0; overflow: hidden; }
+.gms-shell-header .gms-shell-clock { white-space: nowrap; }
+.gms-shell-header .gms-shell-server { white-space: nowrap; }
+.gms-shell-health-dot { flex: 0 0 auto; }
+.gms-page-body { min-width: 0; }
+.gms-page-actions { flex-wrap: wrap; justify-content: flex-end; }
+
+/* Navigation */
+.gms-shell .ant-menu { color: var(--gms-muted); }
+.gms-shell .ant-menu-item,
+.gms-shell .ant-menu-submenu-title { border-radius: 9px; margin: 3px 8px; width: calc(100% - 16px); }
+.gms-shell .ant-menu-item-selected {
+  background: #e7f0f7 !important;
+  color: var(--gms-navy) !important;
+  font-weight: 650;
+}
+.gms-shell .ant-menu-item-selected::after { display: none; }
+.gms-shell .ant-menu-item:hover,
+.gms-shell .ant-menu-submenu-title:hover { background: #f1f5f8 !important; color: var(--gms-navy) !important; }
+.gms-shell .ant-collapse { background: transparent; }
+.gms-shell .ant-collapse-item { border: 0; }
+.gms-shell .ant-collapse-header { border-radius: 9px; color: var(--gms-muted) !important; }
+.gms-shell .ant-collapse-header:hover { background: #f1f5f8; }
+.gms-shell .ant-btn-text:hover { background: #edf3f7; color: var(--gms-navy); }
+
+/* Page framing */
+.gms-page { max-width: 1600px; margin: 0 auto; padding: 28px 32px 44px; }
+.gms-page-head { margin-bottom: 24px !important; align-items: flex-end !important; }
+.gms-page-head h1, .gms-page-head h2, .gms-page-head h3, .gms-page-head h4 { color: var(--gms-ink); letter-spacing: -.02em; }
+.gms-page-head .ant-typography-secondary { color: var(--gms-muted); }
+
+/* Cards, tables and forms */
+.gms-shell .ant-card,
+.gms-page .ant-card {
+  border: 1px solid var(--gms-line);
+  border-radius: 14px;
+  box-shadow: var(--gms-shadow-sm);
+  background: var(--gms-surface);
+}
+.gms-shell .ant-card-head { border-bottom: 1px solid #edf1f4; min-height: 52px; }
+.gms-shell .ant-card-head-title { color: var(--gms-ink); font-weight: 650; }
+.gms-shell .ant-table-wrapper { border-radius: 12px; overflow: hidden; }
+.gms-shell .ant-table { border: 1px solid var(--gms-line); border-radius: 12px; }
+.gms-shell .ant-table-thead > tr > th { background: #eef3f6 !important; color: var(--gms-muted); font-size: 12px; font-weight: 700; }
+.gms-shell .ant-table-tbody > tr:hover > td { background: #f7fafb !important; }
+.gms-shell .ant-input,
+.gms-shell .ant-input-affix-wrapper,
+.gms-shell .ant-select-selector,
+.gms-shell .ant-picker { border-color: #cfdbe4 !important; border-radius: 9px !important; }
+.gms-shell .ant-input:focus,
+.gms-shell .ant-input-affix-wrapper-focused,
+.gms-shell .ant-select-focused .ant-select-selector { border-color: var(--gms-navy) !important; box-shadow: 0 0 0 3px rgba(21,58,91,.12) !important; }
+.gms-shell .ant-btn { border-radius: 9px; font-weight: 600; }
+.gms-shell .ant-btn-primary { background: var(--gms-navy); border-color: var(--gms-navy); box-shadow: 0 4px 10px rgba(21,58,91,.16); }
+.gms-shell .ant-btn-primary:hover { background: var(--gms-navy-2) !important; border-color: var(--gms-navy-2) !important; }
+.gms-shell .ant-tag { border-radius: 999px; }
+.gms-shell .ant-statistic-content { color: var(--gms-navy); }
+
+/* Login */
+.gms-login { min-height: 100vh; background: linear-gradient(140deg, #edf4f8 0%, #f7fafb 55%, #fff1eb 100%) !important; }
+.gms-login-panel { border: 1px solid rgba(21,58,91,.12) !important; border-radius: 20px !important; box-shadow: 0 18px 46px rgba(21,58,91,.14) !important; }
+.gms-login-panel .ant-btn-primary { background: var(--gms-navy); border-color: var(--gms-navy); height: 44px; }
+
+/* Responsive desktop/tablet behavior */
+@media (max-width: 900px) {
+  .gms-page { padding: 20px 18px 34px; }
+  .gms-page-head { align-items: flex-start !important; gap: 12px; flex-wrap: wrap; }
+  .gms-shell .ant-layout-sider { box-shadow: 10px 0 28px rgba(21,58,91,.14); }
+  .gms-shell-header .gms-shell-clock { display: none; }
+}
+@media (max-width: 600px) {
+  .gms-page { padding: 16px 12px 28px; }
+  .gms-page-head { margin-bottom: 16px !important; }
+  .gms-page .ant-card { border-radius: 12px; }
+  .gms-shell .ant-table { font-size: 12px; }
+  .gms-shell .ant-table-thead > tr > th,
+  .gms-shell .ant-table-tbody > tr > td { padding: 9px 8px; }
+  .gms-shell-header { padding-inline: 10px !important; }
+  .gms-shell-header .gms-shell-server { display: none; }
+  .gms-page-actions { width: 100%; justify-content: flex-start; }
+  .gms-page-actions .ant-btn { flex: 1 1 auto; }
+}
+
+/* Dark mode keeps the same hierarchy with a darker neutral canvas. */
+[data-theme='dark'] {
+  --gms-ink: #edf4fa;
+  --gms-muted: #a7b6c5;
+  --gms-line: #294055;
+  --gms-bg: #0d1723;
+  --gms-surface: #111f2d;
+  --gms-navy: #8ec2e5;
+  --gms-navy-2: #b1daf2;
+  --gms-shadow: 0 8px 28px rgba(0,0,0,.22);
+  --gms-shadow-sm: 0 2px 10px rgba(0,0,0,.18);
+}
+[data-theme='dark'] .gms-login { background: linear-gradient(140deg, #0c1824 0%, #122536 55%, #2d211f 100%) !important; }

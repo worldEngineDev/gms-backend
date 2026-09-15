@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
 # dumb-init for proper SIGTERM → graceful shutdown
-RUN apk add --no-cache dumb-init
+RUN apk add --no-cache dumb-init openssh-client sshpass
 
 # PM2 for cluster process management
 RUN npm install -g pm2
@@ -14,7 +14,10 @@ RUN npm ci --omit=dev
 
 # Copy application
 COPY server.js feishu.js ./
-COPY index.html operations.html ./
+COPY realtime.js ./
+COPY lib/ ./lib/
+COPY src/ ./src/
+COPY index.html operations.html mobile.html mobile-ops.html ./
 COPY css/ ./css/
 COPY js/ ./js/
 COPY ecosystem.config.js ./

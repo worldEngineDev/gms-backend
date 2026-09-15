@@ -47,6 +47,22 @@ BACKUP_NAME="gms-ui-backup-${TIMESTAMP}"
 cd /root
 tar -czf gms-backups/${BACKUP_NAME}.tar.gz \
     gms-backend/web/src/common/styles/global.css \
+    gms-backend/web/src/common/styles/redesign.css \
+    gms-backend/web/src/common/components/AppProviders.tsx \
+    gms-backend/web/src/common/components/PageContainer.tsx \
+    gms-backend/web/src/maintenance/layout/AppLayout.tsx \
+    gms-backend/web/src/operations/layout/OpsLayout.tsx \
+    gms-backend/web/src/maintenance/layout/LoginScreen.tsx \
+    gms-backend/web/src/maintenance/main.tsx \
+    gms-backend/web/src/operations/main.tsx \
+    gms-backend/css/mobile.css \
+    gms-backend/css/status-pages.css \
+    gms-backend/mobile.html \
+    gms-backend/mobile-ops.html \
+    gms-backend/sn-status.html \
+    gms-backend/machine-status.html \
+    gms-backend/location-status.html \
+    gms-backend/delivery-note.html \
     gms-backend/web/dist/ \
     gms-backend/index.html \
     gms-backend/operations.html \
@@ -100,16 +116,9 @@ deploy_new_version() {
     # 上传更新的文件到服务器
     log_info "上传文件到 .216 服务器..."
 
-    # 上传 global.css
-    scp src/common/styles/global.css \
-        ${SERVER_USER}@${SERVER}:${REMOTE_PATH}/web/src/common/styles/global.css
-
-    # 上传新组件
-    scp src/common/components/StatsCard.tsx \
-        ${SERVER_USER}@${SERVER}:${REMOTE_PATH}/web/src/common/components/
-
-    scp src/common/components/MachineCard.tsx \
-        ${SERVER_USER}@${SERVER}:${REMOTE_PATH}/web/src/common/components/
+    # 上传独立新版样式（旧 global.css 保留，便于随时恢复）
+    scp src/common/styles/redesign.css \
+        ${SERVER_USER}@${SERVER}:${REMOTE_PATH}/web/src/common/styles/redesign.css
 
     # 上传构建后的 dist 目录
     rsync -avz --delete dist/ \

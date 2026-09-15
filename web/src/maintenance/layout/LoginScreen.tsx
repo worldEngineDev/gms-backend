@@ -40,12 +40,12 @@ export function LoginScreen() {
   return (
     // 登录页对齐 sn-status.html 的浅色风格，强制浅色算法避免深色模式下组件变色
     <ConfigProvider theme={{ algorithm: antTheme.defaultAlgorithm }}>
-    <div style={{
+    <div className="gms-login" style={{
       height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
       background: '#f5f5f7', padding: 20,
     }}>
       {/* 对齐 status-pages 的 .sheet 风格 */}
-      <div style={{
+      <div className="gms-login-panel" style={{
         width: '100%', maxWidth: 360, background: '#fff',
         border: '1px solid #e5e5e5', borderRadius: 12,
         boxShadow: '0 8px 32px rgba(0,0,0,0.08)', padding: 28,

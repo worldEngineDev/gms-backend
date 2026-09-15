@@ -81,6 +81,12 @@ describe('applySecurityHeaders', () => {
     assert.strictEqual(res.getHeader('X-Content-Type-Options'), 'nosniff');
   });
 
+  test('不在不可信 HTTP 来源下发送 COOP', () => {
+    const res = mockRes();
+    applySecurityHeaders(res, { coop: false });
+    assert.strictEqual(res.getHeader('Cross-Origin-Opener-Policy'), undefined);
+  });
+
   test('null res 安全（不抛错）', () => {
     assert.doesNotThrow(() => applySecurityHeaders(null));
     assert.doesNotThrow(() => applySecurityHeaders(undefined));

@@ -147,6 +147,28 @@ const DB_NAME = process.env.DB_NAME || process.env.MYSQL_DATABASE || 'gms';
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const DATA_DIR = path.join(__dirname, 'data');
 const TOKEN_EXPIRY = 2 * 60 * 60 * 1000; // 2 hours sliding window
+const MOBILE_TOKEN_SECRET = process.env.MOBILE_TOKEN_SECRET || process.env.EDGE_TOKEN || 'gms-mobile-session-key';
+
+function createMobileSignedToken(data) {
+  const payload = Buffer.from(JSON.stringify(data)).toString('base64url');
+  const sig = crypto.createHmac('sha256', MOBILE_TOKEN_SECRET).update(payload).digest('base64url');
+  return `m1.${payload}.${sig}`;
+}
+
+function verifyMobileSignedToken(token) {
+  if (!token || !token.startsWith('m1.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const expected = crypto.createHmac('sha256', MOBILE_TOKEN_SECRET).update(parts[1]).digest('base64url');
+  const actualBuf = Buffer.from(parts[2]);
+  const expectedBuf = Buffer.from(expected);
+  if (actualBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(actualBuf, expectedBuf)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (!data || data.expires < Date.now()) return null;
+    return data;
+  } catch { return null; }
+}
 
 // ==================== DATABASE ====================
 const mysql = require('mysql2/promise');
@@ -383,6 +405,24 @@ function initDB() {
       data MEDIUMTEXT,
       createdAt VARCHAR(64),
       INDEX idx_mph_machine (machineNumber, createdAt)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // 机器运行/生产状态连续区间；开放区间 openKey='Y'，每台机器每类仅允许一个开放区间
+    `CREATE TABLE IF NOT EXISTS machine_status_intervals (
+      id VARCHAR(64) PRIMARY KEY,
+      machineNumber VARCHAR(64) NOT NULL,
+      statusType VARCHAR(16) NOT NULL,
+      status VARCHAR(32) NOT NULL,
+      startedAt VARCHAR(64) NOT NULL,
+      endedAt VARCHAR(64) DEFAULT NULL,
+      lastSeenAt VARCHAR(64) DEFAULT NULL,
+      durationSec INT UNSIGNED DEFAULT 0,
+      details MEDIUMTEXT,
+      openKey VARCHAR(1) DEFAULT NULL,
+      createdAt VARCHAR(64),
+      updatedAt VARCHAR(64),
+      INDEX idx_msi_machine_time (machineNumber, statusType, startedAt),
+      INDEX idx_msi_started (startedAt),
+      UNIQUE KEY uq_msi_open (machineNumber, statusType, openKey)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS stocktaking (
       id VARCHAR(64) PRIMARY KEY,
@@ -1024,7 +1064,6 @@ try {
 } catch {}
 
 async function createToken(user, source) {
-  const token = crypto.randomBytes(32).toString('hex');
   const tokenData = {
     userId: user.id, username: user.username,
     displayName: user.displayName || user.username,
@@ -1033,6 +1072,9 @@ async function createToken(user, source) {
     source: source || 'web', // 'web' = 浏览器, 'mobile' = 移动端/链接页
     expires: Date.now() + TOKEN_EXPIRY, lastActive: Date.now(),
   };
+  const token = source === 'mobile'
+    ? createMobileSignedToken(tokenData)
+    : crypto.randomBytes(32).toString('hex');
   // Redis primary + memory fallback
   if (redisClient) {
     await _redisSet(`tk:${token}`, tokenData, TOKEN_EXPIRY / 1000);
@@ -1044,6 +1086,8 @@ async function createToken(user, source) {
 }
 
 async function validateToken(token) {
+  const signedMobile = verifyMobileSignedToken(token);
+  if (signedMobile) return signedMobile;
   // Try Redis first
   let t = null;
   if (redisClient) {
@@ -1059,7 +1103,17 @@ async function validateToken(token) {
       }
     } catch {}
   }
-  // Memory fallback
+  // Memory fallback. PM2 runs multiple workers; when Redis is unavailable,
+  // reload the shared token snapshot so a request routed to another worker
+  // can still use a token created by the login worker.
+  if (!tokens[token]) {
+    try {
+      if (fs.existsSync(tokensPath)) {
+        const persisted = JSON.parse(fs.readFileSync(tokensPath, 'utf8'));
+        if (persisted && persisted[token]) Object.assign(tokens, persisted);
+      }
+    } catch {}
+  }
   t = tokens[token];
   if (!t || t.expires < Date.now()) {
     if (t) { delete tokens[token]; saveTokens(); }
@@ -1145,7 +1199,7 @@ const CACHE_TTL = {
   equipment_config: 300000,  // 5min
   inventory_config: 300000,  // 5min
   sn_registry: 60000,        // 60s
-  machines: 60000,           // 60s
+  machines: 3000,            // Agent 状态实时合并，最多缓存 3s
   tech_support: 120000,      // 2min - 大幅增加，WS实时推送保证数据及时性
   sync: 30000,               // 30s
 };
@@ -1373,7 +1427,7 @@ function sendJSON(res, data, status = 200, req, extraHeaders = {}) {
   // S1+S7: apply security headers. In nonce mode, generate a per-request nonce
   // so CSP headers stay consistent across HTML and JSON responses.
   const nonce = isNonceMode() ? generateNonce() : null;
-  applySecurityHeaders(res, { nonce });
+  applySecurityHeaders(res, { nonce, coop: isHttps(req) });
   if (useGzip) {
     headers['Content-Encoding'] = 'gzip';
     res.writeHead(status, headers);
@@ -1412,7 +1466,9 @@ async function requireAuth(req, res, allowQueryToken = false) {
   // 2. Fall back to cookie (S5: web primary auth path — HttpOnly gms_token cookie)
   if (!token && req.headers['cookie']) {
     const cookies = parseCookies(req.headers['cookie']);
-    token = cookies.gms_token || null;
+    // Mobile has an isolated cookie so desktop login/logout cannot invalidate
+    // the operations mobile session.
+    token = cookies.gms_mobile_token || cookies.gms_token || null;
   }
   // EventSource cannot set Authorization headers on mobile, so only the SSE
   // endpoint may opt into a query token as a legacy/mobile compatibility path.
@@ -1459,7 +1515,7 @@ const ALLOWED_ROOT_FILES = ['manifest.json', 'sw.js', 'gms.apk', 'GMS-手套管�
 
 function blockForbidden(req, res) {
   try {
-    applySecurityHeaders(res);
+    applySecurityHeaders(res, { coop: isHttps(req) });
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end('Not Found');
   } catch {}
@@ -1474,7 +1530,7 @@ function requestGuard(req, res) {
 
   // 1) robots.txt — 明确禁止搜索引擎/爬虫收录
   if (pathname === '/robots.txt' && req.method === 'GET') {
-    applySecurityHeaders(res);
+    applySecurityHeaders(res, { coop: isHttps(req) });
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
     return res.end('User-agent: *\nDisallow: /\n');
   }
@@ -1523,7 +1579,7 @@ function serveStatic(req, res) {
     const ua = (req.headers['user-agent'] || '').toLowerCase();
     const isMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(ua);
     if (isMobile) {
-      applySecurityHeaders(res);
+      applySecurityHeaders(res, { coop: isHttps(req) });
       res.writeHead(302, { 'Location': '/mobile.html', 'Cache-Control': 'no-store' });
       return res.end();
     }
@@ -1564,7 +1620,7 @@ function serveStatic(req, res) {
       'ETag': `"${  cached.ts.toString(36)  }"`,
     };
     // S1+S7: apply security headers to static responses too (covers HTML/JS/CSS)
-    applySecurityHeaders(res, { nonce });
+    applySecurityHeaders(res, { nonce, coop: isHttps(req) });
     // Don't use gzip for HTML with nonce injection — the cached gzipped data
     // doesn't contain the nonce meta tag, and re-gzipping per-request is costly.
     const accept = req.headers['accept-encoding'] || '';
@@ -3277,7 +3333,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') {
       // S1: apply security headers to CORS preflight responses
-      applySecurityHeaders(res);
+      applySecurityHeaders(res, { coop: isHttps(req) });
       res.writeHead(204, {
         ...corsHeadersObj(),
         'Access-Control-Allow-Headers': 'Content-Type, Authorization',
@@ -3289,7 +3345,7 @@ const server = http.createServer(async (req, res) => {
     // Favicon — return SVG icon to avoid 404 in browser console
     if (req.url === '/favicon.ico' && req.method === 'GET') {
       // S1: apply security headers
-      applySecurityHeaders(res);
+      applySecurityHeaders(res, { coop: isHttps(req) });
       res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' });
       return res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y="80" font-size="80">🧤</text></svg>');
     }
@@ -3354,7 +3410,7 @@ const server = http.createServer(async (req, res) => {
       const authUser = await requireAuth(req, res, true);
       if (!authUser) return;
       // S1: apply security headers to SSE handshake
-      applySecurityHeaders(res);
+      applySecurityHeaders(res, { coop: isHttps(req) });
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -3462,8 +3518,6 @@ async function startup() {
       ENABLE_SN_TRANSFER, sendJSON,
       batches: batchesDomain,
     });
-    // 边缘代理域（每台机器上的 heartbeat-agent 上报心跳/设备观测事实）
-    // 先于 machines 创建：machines 列表需注入 loadEdgePresence 合并主机在线状态
     edge = createEdgeHandlers({ pool, redisClient, sendJSON, broadcastSSE, broadcastChange, syncInventoryFromSN: _syncInventoryFromSN });
     edge.startSweeper();
     machines = createMachinesHandlers({
@@ -3475,7 +3529,7 @@ async function startup() {
       _snToInvType,
       broadcastChange, broadcastSSE,
       loadEdgePresence: edge.loadEdgePresence,
-      getEdgeLive: require('./src/edge-live').getEdgeLive,
+      getEdgeLive: require('./src/edge-live').getEdgeLive
     });
     snRegistry = createSNRegistryHandlers({
       pool, sendJSON,
@@ -3495,14 +3549,6 @@ async function startup() {
       // 工单联动机器生产状态：提交→待维修，完成/删除→可生产
       setProductionStatus: (...args) => machines.setProductionStatus(...args),
     });
-    // 边缘代理故障类告警 → 自动创建技术支持工单（edge 先于 techSupport 创建，此处回填）
-    if (edge && typeof edge.setTicketCreator === 'function') {
-      edge.setTicketCreator(techSupport.createSystemTicket);
-    }
-    // 机器恢复录制 → 自动完成采集类自动工单（采集员自修后上机录制，自动闭环）
-    if (edge && typeof edge.setTicketCompleter === 'function') {
-      edge.setTicketCompleter(techSupport.autoCompleteCollectorTickets);
-    }
 
     // PWA Web Push handlers
     push = createPushHandlers({
@@ -3581,9 +3627,8 @@ async function startup() {
     // exposure) so exempting it from the CSRF gate is acceptable.
     publicRouter.register('/api/logout',                 'POST', auth.handleLogout,             { auth:'none' });
     publicRouter.register('/api/machine-code',            'GET',  machines.handleGetMachineCode, { auth:'none' });
-    // 边缘代理接入：Bearer EDGE_TOKEN 认证（Bearer 请求天然豁免 CSRF），agent 只上报观测事实
     publicRouter.register('/api/edge/heartbeat', 'POST', edge.handleHeartbeat, { auth:'none', body:true });
-    publicRouter.register('/api/edge/offline',   'POST', edge.handleOffline,   { auth:'none', body:true });
+    publicRouter.register('/api/edge/offline', 'POST', edge.handleOffline, { auth:'none', body:true });
     publicRouter.registerPattern(/^\/api\/sn-registry\/([^/]+)\/status$/,  'GET', snRegistry.handleGetSNStatus,        { auth:'none' });
     publicRouter.registerPattern(/^\/api\/sn-registry\/([^/]+)\/history$/, 'GET', snRegistry.handleGetSNStatusHistory, { auth:'none' });
     publicRouter.register('/api/mobile/auth', 'POST', auth.handleMobileAuth, {
@@ -3658,20 +3703,24 @@ async function startup() {
     // 机器生产状态：人工切换（可生产/在生产/在测试；待维修由工单驱动）+ 变更记录查询
     authRouter.register('/api/machines/production-status',  'POST', machines.handleSetProductionStatus,  { auth:'required', body:true });
     authRouter.register('/api/machines/production-history', 'GET',  machines.handleGetProductionHistory, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/status-timeline$/, 'GET', machines.handleGetStatusTimeline, { auth:'required' });
     // 机器综合信息（采集器系统健康/任务/活动状态，szx3-* 机器）
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/info$/, 'GET', machines.handleGetMachineInfo, { auth:'required' });
+    // 运营端机器状态中心：登录、任务、Hermes、处理队列、上传及全天会话聚合
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/operations-center$/, 'GET', machines.handleGetOperationsCenter, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/live$/, 'GET', machines.handleGetMachineLive, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/stop-collector$/, 'POST', machines.handleStopCollector, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/stop-exodus$/, 'POST', machines.handleStopExodus, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/fix-quest$/, 'POST', machines.handleFixQuest, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/quest-control$/, 'POST', machines.handleQuestControl, { auth:'required', body:true });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/diagnose-hands$/, 'POST', machines.handleDiagnoseHands, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/diagnose-progress$/, 'GET', machines.handleDiagnoseProgress, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/machine-config$/, 'GET', machines.handleMachineConfig, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/probe$/, 'POST', machines.handleMachineProbe, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/machine-commands$/, 'GET', machines.handleMachineCommands, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/machine-command$/, 'POST', machines.handleMachineCommand, { auth:'required', body:true });
-    // 机械臂状态切换功能暂未启用（SDK 端口与 mono 采集器冲突），先注释掉路由
-    // authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/arm-control$/, 'POST', machines.handleArmControl, { auth:'required', body:true });
-    authRouter.register('/api/edge/hosts', 'GET', edge.handleListHosts, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/arm-control$/, 'POST', machines.handleArmControl, { auth:'required', body:true });
+    authRouter.register('/api/edge/hosts', 'GET', machines.handleListAgentHosts, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/shift-inspection$/,   'POST', handleSaveShiftInspection,   { auth:'required', body:true });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/shift-inspections$/,  'GET',  handleGetShiftInspections,   { auth:'required' });
     authRouter.register('/api/shift-inspections/today',  'GET',  handleTodayShiftInspections,      { auth:'required' });
@@ -3981,45 +4030,19 @@ async function startup() {
     // back through /api/auth/verify.
     realtime.init(server, { isConnected: () => redisClient && redisClient.isReady, subscribe: async (ch, fn) => { if (redisSub) await redisSub.subscribe(ch, fn); }, SSE_CHANNEL: 'sse:all' }, { validateToken });
 
-    // 边缘 agent WebSocket 长连接：每 ~2s 推送采集器原始数据到内存缓存（/live SSE 流消费）
-    // 断开 10s 仍未重连 → 标记离线并广播（比 30s HTTP 心跳超时感知快得多）
+    // Agent WebSocket fast channel: collector snapshots are pushed every few
+    // seconds and served from the in-memory edge-live cache.
     const { WebSocketServer } = require('ws');
     const edgeLive = require('./src/edge-live');
     const edgeWss = new WebSocketServer({ server, path: '/api/edge/ws' });
-    const wsOfflineTimers = new Map();
     edgeWss.on('connection', (ws, req) => {
-      try {
-        const u = new URL(req.url, 'http://localhost');
-        const token = u.searchParams.get('token') || '';
-        const machineNumber = String(u.searchParams.get('machine') || '').trim().toLowerCase();
-        if (!machineNumber || token !== (process.env.EDGE_TOKEN || '')) { ws.close(4001, 'unauthorized'); return; }
-        ws.edgeMachine = machineNumber;
-        edgeLive.markEdgeWsConnected(machineNumber, true);
-        const t = wsOfflineTimers.get(machineNumber);
-        if (t) { clearTimeout(t); wsOfflineTimers.delete(machineNumber); }
-        console.log(`[EDGE-WS] ${machineNumber} 已连接`);
-        ws.on('message', (raw) => {
-          try {
-            const msg = JSON.parse(raw.toString());
-            if (msg.type === 'fast' && msg.data) edgeLive.setEdgeLive(machineNumber, msg.data);
-          } catch { }
-        });
-        ws.on('close', () => {
-          edgeLive.markEdgeWsConnected(machineNumber, false);
-          console.log(`[EDGE-WS] ${machineNumber} 已断开，10s 宽限后判离线`);
-          const old = wsOfflineTimers.get(machineNumber);
-          if (old) clearTimeout(old);
-          wsOfflineTimers.set(machineNumber, setTimeout(async () => {
-            wsOfflineTimers.delete(machineNumber);
-            try {
-              await pool.execute("UPDATE edge_hosts SET status = 'offline', updatedAt = ? WHERE machineNumber = ?", [new Date().toISOString(), machineNumber]);
-              try { if (redisClient && redisClient.del) await redisClient.del(`edge:presence:${machineNumber}`); } catch { }
-              try { broadcastSSE('machine_presence_updated', { machineNumber, offline: true }); } catch { }
-              console.log(`[EDGE-WS] ${machineNumber} 判定离线`);
-            } catch (e) { console.error('[EDGE-WS] 离线落库失败:', e.message); }
-          }, 10000));
-        });
-      } catch (e) { console.error('[EDGE-WS] 连接处理失败:', e.message); try { ws.close(); } catch { } }
+      const u = new URL(req.url, 'http://localhost');
+      const token = u.searchParams.get('token') || '';
+      const machineNumber = String(u.searchParams.get('machine') || '').trim().toLowerCase();
+      if (!machineNumber || token !== (process.env.EDGE_TOKEN || '')) { ws.close(4001, 'unauthorized'); return; }
+      edgeLive.markEdgeWsConnected(machineNumber, true);
+      ws.on('message', raw => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'fast' && msg.data) edgeLive.setEdgeLive(machineNumber, msg.data); } catch {} });
+      ws.on('close', () => edgeLive.markEdgeWsConnected(machineNumber, false));
     });
 
     // Feishu sync initialized lazily on first tech_support operation

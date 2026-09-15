@@ -13,15 +13,15 @@ interface Props {
 
 export function PageContainer({ title, subtitle, extra, children }: Props) {
   return (
-    <div style={{ padding: '20px 24px' }}>
-      <Flex justify="space-between" align="center" style={{ marginBottom: 16 }}>
+    <div className="gms-page">
+      <Flex className="gms-page-head" justify="space-between" align="center" style={{ marginBottom: 16 }}>
         <div>
           <Title level={4} style={{ margin: 0 }}>{title}</Title>
           {subtitle && <Text type="secondary" style={{ fontSize: 13 }}>{subtitle}</Text>}
         </div>
-        {extra && <Flex gap={8}>{extra}</Flex>}
+        {extra && <Flex className="gms-page-actions" gap={8}>{extra}</Flex>}
       </Flex>
-      {children}
+      <section className="gms-page-body">{children}</section>
     </div>
   );
 }

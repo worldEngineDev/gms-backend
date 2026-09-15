@@ -1,5 +1,5 @@
 // 全局 Provider：QueryClient + AntD 主题（深浅色）+ 中文语言环境
-import React from 'react';
+import React, { useEffect } from 'react';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { App as AntApp, ConfigProvider, theme as antTheme } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
@@ -11,14 +11,16 @@ import { GlobalOverlays } from './GlobalOverlays';
 
 dayjs.locale('zh-cn');
 
-// 视觉语言对齐 css/status-pages.css（sn-status.html）：
-// 黑白中性主色 / Inter 字体 / #e5e5e5 细边框 / #f5f5f7 底 / 圆角 8-12
+// 统一桌面与移动端的 Worldengine 视觉语言；旧页面结构和业务行为保持不变。
 const FONT_SANS = "'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif";
 const FONT_MONO = "'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace";
 
 export function AppProviders({ children }: { children: React.ReactNode }) {
   const theme = useUIStore(s => s.theme);
   const dark = theme === 'dark';
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
   return (
     <QueryClientProvider client={queryClient}>
       <ConfigProvider
@@ -26,17 +28,16 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
         theme={{
           algorithm: dark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
           token: {
-            // 黑白中性主色（浅色黑按钮 / 深色白按钮，同 sn-status 的 .btn-primary）
-            colorPrimary: dark ? '#fafafa' : '#0a0a0a',
-            colorInfo: dark ? '#fafafa' : '#0a0a0a',
-            colorTextBase: dark ? undefined : '#0a0a0a',
-            colorBgLayout: dark ? undefined : '#f5f5f7',
+            colorPrimary: dark ? '#8ec2e5' : '#153a5b',
+            colorInfo: dark ? '#8ec2e5' : '#153a5b',
+            colorTextBase: dark ? undefined : '#152238',
+            colorBgLayout: dark ? undefined : '#f3f6f8',
             colorBgContainer: dark ? undefined : '#ffffff',
-            colorBorder: dark ? undefined : '#e5e5e5',
-            colorBorderSecondary: dark ? undefined : '#f1f3f5',
-            colorError: '#be123c',
-            colorSuccess: '#047857',
-            colorWarning: '#92400e',
+            colorBorder: dark ? undefined : '#dce5ec',
+            colorBorderSecondary: dark ? undefined : '#edf1f4',
+            colorError: '#c84f4a',
+            colorSuccess: '#16866b',
+            colorWarning: '#b7791f',
             borderRadius: 8,
             borderRadiusLG: 12,
             fontFamily: FONT_SANS,
@@ -44,26 +45,26 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
             controlHeight: 40,
           },
           components: {
-            Card: { borderRadiusLG: 12, colorBorderSecondary: dark ? undefined : '#e5e5e5' },
-            Button: { fontWeight: 600, defaultBorderColor: dark ? undefined : '#e5e5e5', defaultColor: dark ? undefined : '#525252' },
-            Input: { activeBorderColor: dark ? undefined : '#0a0a0a', hoverBorderColor: dark ? undefined : '#d4d4d4' },
+            Card: { borderRadiusLG: 14, colorBorderSecondary: dark ? undefined : '#dce5ec' },
+            Button: { fontWeight: 600, defaultBorderColor: dark ? undefined : '#cfdbe4', defaultColor: dark ? undefined : '#556579' },
+            Input: { activeBorderColor: dark ? undefined : '#153a5b', hoverBorderColor: dark ? undefined : '#b9c8d6' },
             Select: { optionSelectedBg: dark ? undefined : '#f1f3f5' },
             Menu: {
               itemBorderRadius: 8,
-              itemSelectedBg: dark ? undefined : '#f1f3f5',
-              itemSelectedColor: dark ? undefined : '#0a0a0a',
-              itemHoverBg: dark ? undefined : '#f8f9fa',
-              itemColor: dark ? undefined : '#525252',
-              groupTitleColor: dark ? undefined : '#a1a1a1',
+              itemSelectedBg: dark ? undefined : '#e7f0f7',
+              itemSelectedColor: dark ? undefined : '#153a5b',
+              itemHoverBg: dark ? undefined : '#f1f5f8',
+              itemColor: dark ? undefined : '#556579',
+              groupTitleColor: dark ? undefined : '#8a98a9',
               groupTitleFontSize: 11,
             },
-            Table: { headerBg: dark ? undefined : '#f8f9fa', headerColor: dark ? undefined : '#a1a1a1', borderColor: dark ? undefined : '#f1f3f5' },
+            Table: { headerBg: dark ? undefined : '#eef3f6', headerColor: dark ? undefined : '#64748b', borderColor: dark ? undefined : '#edf1f4' },
             Tag: { borderRadiusSM: 6 },
-            Layout: { siderBg: dark ? undefined : '#ffffff', headerBg: dark ? undefined : '#ffffff', bodyBg: dark ? undefined : '#f5f5f7' },
+            Layout: { siderBg: dark ? undefined : '#ffffff', headerBg: dark ? undefined : '#ffffff', bodyBg: dark ? undefined : '#f3f6f8' },
           },
         }}
       >
-        <AntApp>
+        <AntApp message={{ duration: 5 }}>
           {children}
           <GlobalOverlays />
         </AntApp>

@@ -13,13 +13,39 @@ const API = {
   // S4.5: CSRF token (memory only — fetched from /api/csrf-token on init/login)
   csrfToken: null,
 
+  _decodeMobileUser(token) {
+    try {
+      if (!token || token.indexOf('m1.') !== 0) return null;
+      const payload = token.split('.')[1];
+      const data = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/') + '=='));
+      if (!data || !data.userId || !data.username || (data.expires && data.expires < Date.now())) return null;
+      return {
+        id: data.userId,
+        userId: data.userId,
+        username: data.username,
+        displayName: data.displayName || data.username,
+        role: data.role,
+        system: data.system || 'maintenance',
+        lockedDeviceType: data.lockedDeviceType || null,
+      };
+    } catch { return null; }
+  },
+
   async init() {
+    this._authErrorPending = false;
+    this._authErrorHandled = false;
     // S5.3 (design A): Web auth token lives ONLY in the HttpOnly gms_token cookie.
     // Never read it from localStorage, never keep it in JS memory — XSS cannot
     // steal what isn't there. this.token stays null for web; mobile (/api/mobile/auth)
     // still sets it in-memory for Bearer auth (separate native client, no localStorage risk).
+    // Mobile sessions are restored by the HttpOnly cookie; discard stale local
+    // Bearer tokens left by previous versions.
     this.token = null;
     this.currentUser = JSON.parse(localStorage.getItem('gms_user') || sessionStorage.getItem('gms_user') || 'null');
+    if (this.clientMode === 'mobile' && !this.currentUser) {
+      this.currentUser = this._decodeMobileUser(this.token);
+      if (this.currentUser) localStorage.setItem('gms_user', JSON.stringify(this.currentUser));
+    }
 
     // ========== 分布式配置初始化 ==========
     // 初始化分布式模块，选择最佳服务器
@@ -50,6 +76,13 @@ const API = {
     } else {
       this.online = await this._checkServer();
     }
+    // A restored mobile Bearer token is sufficient to attempt authenticated calls
+    // even when the health probe briefly fails.
+    // Mobile sessions may rely on the durable HttpOnly cookie when WebView
+    // storage is intermittently unavailable. A remembered user is enough to
+    // attempt authenticated API calls; do not turn the whole dashboard into
+    // empty arrays because /api/health briefly timed out.
+    if (this.clientMode === 'mobile' && (this.token || this.currentUser)) this.online = true;
 
     // Auto-restore currentUser from login history (same device, within 24h).
     // S5.3: token is no longer restored — the HttpOnly cookie (7-day TTL) is the
@@ -64,9 +97,9 @@ const API = {
 
     // 即使 _checkServer 失败，也尝试验证 cookie — 如果有效则恢复 online 状态
     // S5.3: rely on cookie auth (no Bearer header); _fetchWithTimeout sends credentials.
-    if (!this.online) {
+    if (!this.online && this.clientMode !== 'mobile') {
       try {
-        const res = await this._fetchWithTimeout(`${this.baseURL  }/api/settings`, {}, 3000);
+        const res = await this._fetchWithTimeout(`${this.baseURL  }/api/settings`, { headers: this._headers() }, 3000);
         if (res.ok) {
           this.online = true;
           console.log('[API] Cookie 验证成功，恢复在线状态');
@@ -92,15 +125,33 @@ const API = {
     if (this.online) {
       const valid = await this._validateToken();
       if (!valid) {
-        // Cookie session invalid (server restarted / cookie expired) — force re-login
-        this.logout('session_expired');
-        return true; // Still online, just need fresh login
+        // A completed 401 is authoritative. Network failures remain recoverable on
+        // mobile, where WebViews frequently resume before the LAN is reachable.
+        if (this.clientMode !== 'mobile' || this._lastAuthValidationStatus === 401) {
+          this.logout('session_expired');
+          return true;
+        }
       }
       // S4.5: Fetch CSRF token after auth — needed for non-GET requests when CSRF_ENFORCED=true
       this._fetchCSRFToken();
-      this._listenSSE();
+      // mobile.js owns a dedicated SSE channel with view-aware debouncing.
+      // Starting the generic API channel as well doubles every event-driven
+      // refresh and quickly trips the server rate limiter.
+      if (this.clientMode !== 'mobile') this._listenSSE();
       this._setupBeforeUnload();
       this._startVersionCheck(); // 启动版本检测，服务器更新时自动刷新
+      // Mobile WebViews may clear localStorage while retaining cookies. Restore
+      // the user profile from the authenticated API session before the page
+      // decides whether to show the login screen.
+      if (this.clientMode === 'mobile' && !this.currentUser) {
+        try {
+          const me = await this._fetch('GET', '/api/me');
+          if (me && !me.error) {
+            this.currentUser = me.user || me;
+            localStorage.setItem('gms_user', JSON.stringify(this.currentUser));
+          }
+        } catch {}
+      }
     }
     return this.online;
   },
@@ -114,7 +165,7 @@ const API = {
     if (!this.online) return;
     try {
       const headers = {};
-      if (this.token) headers['Authorization'] = `Bearer ${  this.token}`;
+      if (this.token && this.clientMode !== 'mobile') headers['Authorization'] = `Bearer ${  this.token}`;
       const res = await this._fetchWithTimeout(`${this.baseURL  }/api/csrf-token`, {
         method: 'GET',
         headers,
@@ -190,9 +241,28 @@ const API = {
     // S5.3: rely on HttpOnly cookie auth (no Bearer header). _fetchWithTimeout
     // sends credentials=same-origin so the gms_token cookie is included.
     try {
-      const res = await this._fetchWithTimeout(`${this.baseURL  }/api/settings`, {}, 3000);
-      return res.ok;
-    } catch { return false; }
+      const res = await this._fetchWithTimeout(`${this.baseURL  }/api/settings`, { headers: this._headers() }, 3000);
+      this._lastAuthValidationStatus = res.status;
+      if (res.ok) return true;
+      // A stale mobile Bearer header prevents the server from falling back to
+      // the durable gms_token cookie. Retry once without Bearer auth.
+      if (this.clientMode === 'mobile' && res.status === 401 && this.token) {
+        const stale = this.token;
+        this.token = null;
+        const cookieRes = await this._fetchWithTimeout(`${this.baseURL  }/api/settings`, {}, 3000);
+        this._lastAuthValidationStatus = cookieRes.status;
+        if (cookieRes.ok) {
+          localStorage.removeItem('gms_mobile_token');
+          sessionStorage.removeItem('gms_mobile_token');
+          return true;
+        }
+        this.token = stale;
+      }
+      return false;
+    } catch {
+      this._lastAuthValidationStatus = 0;
+      return false;
+    }
   },
 
   async login(username, password, manualMachineCode = null) {
@@ -207,7 +277,8 @@ const API = {
           machineCode = mcData.machineCode;
         } catch {}
       }
-      const res = await this._fetchWithTimeout(`${this.baseURL  }/api/auth/login`, {
+      const authPath = this.clientMode === 'mobile' ? '/api/mobile/auth' : '/api/auth/login';
+      const res = await this._fetchWithTimeout(`${this.baseURL  }${authPath}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password, machineCode })
       }, 10000); // BUGFIX: 5s→10s，scrypt 验证 + DB 查询在服务器负载高时可能超时
@@ -220,6 +291,11 @@ const API = {
         // rides the cookie. Mobile (/api/mobile/auth) is a separate path that still
         // keeps the token in-memory for Bearer auth.
         this.token = null;
+        this._authErrorPending = false;
+        if (this.clientMode === 'mobile') {
+          localStorage.removeItem('gms_mobile_token');
+          sessionStorage.removeItem('gms_mobile_token');
+        }
         this.currentUser = data.user;
         this.online = true;
         localStorage.setItem('gms_user', JSON.stringify(data.user));
@@ -229,13 +305,13 @@ const API = {
         // 离线登录用 SHA-256 对比 scrypt 哈希必然失败，用户看到"用户名或密码错误"
         // 但实际上服务器已成功设置了 HttpOnly cookie（刷新即登录）
         try {
-          this._listenSSE();
+          if (this.clientMode !== 'mobile') this._listenSSE();
           this._setupBeforeUnload();
           // S4.5: Fetch CSRF token after successful login
           this._fetchCSRFToken();
           // Sync store with new credentials
           if (typeof GMSStore !== 'undefined') {
-            GMSStore.setToken(null);
+            GMSStore.setToken(this.token);
             GMSStore.setOnline(true);
           }
           // 记住登录态（Cookie 7天有效）
@@ -312,6 +388,8 @@ const API = {
     localStorage.removeItem('gms_user'); sessionStorage.removeItem('gms_user');
     localStorage.removeItem('gms_login_history');
     localStorage.removeItem('gms_login_token');
+    localStorage.removeItem('gms_mobile_token');
+    sessionStorage.removeItem('gms_mobile_token');
     if (this.eventSource) { this.eventSource.close(); this.eventSource = null; }
     // S4.5: clear CSRF token + refresh timer on logout
     this.csrfToken = null;
@@ -658,6 +736,10 @@ const API = {
   },
 
   _headers() {
+    // Mobile uses the HttpOnly gms_token cookie as the single session source.
+    // Do not send the legacy Bearer token: a stale local token can override a
+    // valid cookie and make every page request look empty.
+    if (this.clientMode === 'mobile') return { 'Content-Type': 'application/json' };
     return this.token ? { 'Content-Type': 'application/json', 'Authorization': `Bearer ${  this.token}` } : { 'Content-Type': 'application/json' };
   },
 
@@ -678,8 +760,9 @@ const API = {
   // (Previously _fetch returned null on 401 and callers silently fell back to localStorage, masking the error.)
 
   async _fetch(method, path, body, timeoutMs) {
-    if (!this.online) return null;
-    if (this._authErrorPending) return null; // short-circuit: token known-bad, don't spam server
+    if (!this.online && this.clientMode !== 'mobile') return null;
+    if (this.clientMode === 'mobile' && !this.online) this.online = true;
+    if (this._authErrorPending) return null;
     try {
       const opts = { method, headers: this._headers() };
       if (body) opts.body = JSON.stringify(body);
@@ -693,7 +776,24 @@ const API = {
       // 检测 401 错误 - token 过期：置位阻塞标志，触发重新登录流程
       if (res.status === 401) {
         console.warn('[API] Token expired or unauthorized');
+        if (this.clientMode === 'mobile' && this.token) {
+          // Retry the same request with the durable HttpOnly cookie. A stale
+          // local Bearer token must not make every mobile tab appear empty.
+          const staleToken = this.token;
+          const retryOpts = { method, headers: { 'Content-Type': 'application/json' } };
+          if (body) retryOpts.body = JSON.stringify(body);
+          const retry = await this._fetchWithTimeout(this.baseURL + path, retryOpts, Math.min(timeoutMs || 15000, 5000));
+          if (retry.ok) {
+            this.token = null;
+            localStorage.removeItem('gms_mobile_token');
+            sessionStorage.removeItem('gms_mobile_token');
+            const retryData = await retry.json();
+            return retryData;
+          }
+          this.token = staleToken;
+        }
         this._authErrorPending = true;
+        if (this.clientMode === 'mobile') this.logout('session_expired');
         this._handleAuthError();
         return null;
       }
@@ -843,8 +943,10 @@ const API = {
   // Machines
   async getMachines() {
     if (!this.online) return Storage._local.getMachines();
-    const data = await this._fetch('GET', '/api/machines');
-    return Array.isArray(data) ? data : Storage._local.getMachines();
+    const data = await this._fetch('GET', this.clientMode === 'mobile' ? '/api/mobile/machines' : '/api/machines');
+    if (Array.isArray(data)) return data;
+    if (this.clientMode === 'mobile' && data && Array.isArray(data.machines)) return data.machines;
+    return Storage._local.getMachines();
   },
 
   async addMachine(machine) {
@@ -864,6 +966,12 @@ const API = {
     const qs = machineNumber ? '?machineNumber=' + encodeURIComponent(machineNumber) : '';
     const data = await this._fetch('GET', '/api/machines/production-history' + qs);
     return Array.isArray(data?.items) ? data.items : [];
+  },
+
+  async getMachineStatusTimeline(machineNumber, date) {
+    if (!this.online) return { success: false, intervals: [], productionIntervals: [], summary: {} };
+    const qs = date ? '?date=' + encodeURIComponent(date) : '';
+    return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/status-timeline' + qs);
   },
 
   async setProductionStatus(machineNumber, status, reason) {
@@ -889,12 +997,17 @@ const API = {
     return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/fix-quest', null, 170000);
   },
 
-  async diagnoseHands(machineNumber) {
-    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/diagnose-hands', null, 180000);
+  async diagnoseHands(machineNumber, side) {
+    const scope = side === 'left' || side === 'right' ? side : 'all';
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/diagnose-hands?side=' + encodeURIComponent(scope), null, 180000);
   },
   // 灵巧手检测实时进度（agent 侧状态，前端轮询）
-  async diagnoseProgress(machineNumber) {
-    return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/diagnose-progress', null, 8000);
+  async diagnoseProgress(machineNumber, side) {
+    const scope = side === 'left' || side === 'right' ? side : 'all';
+    return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/diagnose-progress?side=' + encodeURIComponent(scope), null, 8000);
+  },
+  async probeMachine(machineNumber) {
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/probe', null, 35000);
   },
   async getMachineConfig(machineNumber) {
     return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/machine-config', null, 20000);
@@ -907,10 +1020,10 @@ const API = {
   async runMachineCommand(machineNumber, key) {
     return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/machine-command', { key }, 40000);
   },
-  // 机械臂状态切换功能暂未启用，先注释掉
-  // async armControl(machineNumber, action, arm, state) {
-  //   return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/arm-control', { action, arm, state }, 35000);
-  // },
+  async armControl(machineNumber, action, arm, state, options) {
+    const payload = Object.assign({ action, arm, state }, options || {});
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/arm-control', payload, 35000);
+  },
 
   // 机器实时流（SSE over fetch）：服务端每 ~2s 直连采集器推送；返回 AbortController，调用方 abort() 结束
   streamMachineLive(machineNumber, onData) {

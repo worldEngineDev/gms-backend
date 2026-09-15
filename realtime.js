@@ -71,7 +71,7 @@ function init(httpServer, redisModule, deps = {}) {
     maxPayload: 256 * 1024,
     perMessageDeflate: false,       // 实时消息小, 关闭压缩降低延迟
   });
-  // 手动分发升级请求：只接管 /ws，其他路径（如 /api/edge/ws）留给各自的 WSS
+  // 手动分发升级请求：只接管应用实时通道 /ws。
   httpServer.on('upgrade', (req, socket, head) => {
     let pathname = '';
     try { pathname = new URL(req.url, 'http://localhost').pathname; } catch { }

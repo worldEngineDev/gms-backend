@@ -53,10 +53,43 @@ export const getProductionHistory = (machineNumber?: string) =>
   get<{ success: boolean; items: any[] }>(
     `/api/machines/production-history${machineNumber ? `?machineNumber=${encodeURIComponent(machineNumber)}` : ''}`
   ).then(r => r.items || []);
+export const getMachineStatusTimeline = (machineNumber: string, date?: string) =>
+  get<{
+    success: boolean;
+    machineNumber: string;
+    date: string;
+    intervals: any[];
+    productionIntervals: any[];
+    summary: Record<string, { seconds: number; label: string }>;
+    productionSummary?: Record<string, { seconds: number; label: string }>;
+    statusMeta: Record<string, { label: string; color: string }>;
+  }>(`/api/machines/${encodeURIComponent(machineNumber)}/status-timeline${date ? `?date=${encodeURIComponent(date)}` : ''}`);
 // 采集器综合状态（机器状态信息：任务/操作员/灵巧手/手套/Quest/摄像头/系统程序/容器）
 // opts.refresh=true 时服务端强制直连采集器实时抓取（绕过心跳快照缓存）
 export const getMachineInfo = (machineNumber: string, opts?: { refresh?: boolean }) =>
   get<any>(`/api/machines/${encodeURIComponent(machineNumber)}/info${opts?.refresh ? '?refresh=1' : ''}`, 12000);
+
+// 运营机器状态中心：Importer 登录/任务、Hermes 工作流、处理状态、上传及全天会话。
+export const getMachineOperationsCenter = (
+  machineNumber: string,
+  period?: { since?: number; until?: number },
+) => {
+  const params = new URLSearchParams();
+  if (period?.since != null) params.set('since', String(period.since));
+  if (period?.until != null) params.set('until', String(period.until));
+  const query = params.toString();
+  return get<any>(
+    `/api/machines/${encodeURIComponent(machineNumber)}/operations-center${query ? `?${query}` : ''}`,
+    12000,
+  );
+};
+
+// 机械臂连接会话：连接/退出由现场操作员显式触发。退出只释放 Agent
+// 的 Marvin SDK 端口，不会启停 main/采集器容器。
+export const armControl = (machineNumber: string, action: string, options: Record<string, any> = {}) =>
+  post<any>(`/api/machines/${encodeURIComponent(machineNumber)}/arm-control`, { action, ...options }, 40000);
+export const questControl = (machineNumber: string, action: 'connect'|'disconnect') =>
+  post<any>(`/api/machines/${encodeURIComponent(machineNumber)}/quest-control`, { action }, 40000);
 
 // 机器实时流（SSE over fetch）：弹窗打开期间订阅，服务端每 ~2s 直连采集器推送
 export async function streamMachineLive(

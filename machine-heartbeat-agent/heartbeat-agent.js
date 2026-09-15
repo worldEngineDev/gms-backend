@@ -11,7 +11,7 @@ const {
   safeContainerName,
 } = require('./container-resolver');
 
-const AGENT_VERSION = '1.3.2';
+const AGENT_VERSION = '1.3.6';
 
 const CONFIG = {
   backendUrl: process.env.GMS_BACKEND_URL || 'http://10.5.51.216:8765',
@@ -157,10 +157,11 @@ const collectorApi = new CollectorApiPoller({
 
 let collectorPollAt = 0;
 let collectorPollPromise = null;
+const FAST_COLLECTOR_INTERVAL = parseInt(process.env.FAST_COLLECTOR_INTERVAL || '5', 10) * 1000;
 
 async function pollCollectorApis(force = false) {
   const now = Date.now();
-  if (!force && collectorPollAt && now - collectorPollAt < CONFIG.heartbeatInterval) return;
+  if (!force && collectorPollAt && now - collectorPollAt < FAST_COLLECTOR_INTERVAL) return;
   if (collectorPollPromise) return collectorPollPromise;
   collectorPollPromise = collectorApi.poll()
     .then(snapshot => {
@@ -249,6 +250,56 @@ async function execDockerFilesForRole(role, actionName, files, commandFactory, o
     return _execAsync(commandFactory(name), opts);
   });
   return { container, stdout: result.stdout || '', stderr: result.stderr || '' };
+}
+
+// Mechanical-arm SDK is isolated in a long-lived broker inside importer.
+// The importer container has the glibc runtime required by libMarvinSDK.so;
+// the heartbeat agent only forwards JSON commands and never opens the robot
+// controller port itself.
+let armBrokerInitPromise = null;
+async function runArmBrokerCommand(payload, timeout = 35000) {
+  const importer = await resolveContainer('importer', { force: true });
+  if (!importer) return { success: false, sdkCalled: false, error: '未找到运行中的 importer 容器' };
+  if (!armBrokerInitPromise) {
+    armBrokerInitPromise = (async () => {
+      // heartbeat-agent 自身已经携带 Broker 脚本和 SDK 库，直接从
+      // 通过 docker exec 管道传输文件，而不是 docker cp：Agent 运行在
+      // 容器内时，宿主机 docker daemon 看不到 Agent 的 /app 路径。
+      await _execAsync(`cat /app/marvin-sdk-broker.py | docker exec -i ${importer} sh -c 'cat > /tmp/marvin-sdk-broker.py'`, { timeout: 5000 });
+      await _execAsync(`cat /app/libMarvinSDK.so | docker exec -i ${importer} sh -c 'cat > /tmp/libMarvinSDK.so'`, { timeout: 10000 });
+      const stateCheck = `docker exec ${importer} python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:3011/state", timeout=1)'`;
+      try {
+        await _execAsync(stateCheck, { timeout: 3000 });
+      } catch {
+        await _execAsync(`docker exec -d ${importer} python3 /tmp/marvin-sdk-broker.py --lib /tmp/libMarvinSDK.so --robot-ip 192.168.1.190`, { timeout: 5000 });
+        let ready = false;
+        for (let attempt = 0; attempt < 15; attempt += 1) {
+          try {
+            await _execAsync(stateCheck, { timeout: 1000 });
+            ready = true;
+            break;
+          } catch {
+            await new Promise(resolve => setTimeout(resolve, 200));
+          }
+        }
+        if (!ready) throw new Error('SDK Broker 启动后未就绪');
+      }
+      return importer;
+    })().catch(error => { armBrokerInitPromise = null; throw error; });
+  }
+  try { await armBrokerInitPromise; } catch (error) {
+    return { success: false, sdkCalled: false, error: `机械臂 SDK Broker 启动失败: ${error.message}` };
+  }
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64');
+  const command = `echo ${encoded} | base64 -d | docker exec -i ${importer} python3 -c 'import sys,urllib.request; d=sys.stdin.buffer.read(); r=urllib.request.Request("http://127.0.0.1:3011/command", data=d, headers={"Content-Type":"application/json"}); print(urllib.request.urlopen(r, timeout=30).read().decode())'`;
+  try {
+    const result = await _execAsync(command, { timeout, maxBuffer: 1024 * 1024 });
+    const line = (result.stdout || '').trim().split(/\n/).pop();
+    return JSON.parse(line || '{}');
+  } catch (error) {
+    const detail = (error.stderr || error.message || '').toString().slice(-500);
+    return { success: false, sdkCalled: false, error: `机械臂 SDK Broker 调用失败: ${detail}` };
+  }
 }
 
 async function execStreamDockerForRole(role, actionName, commandFactory, onLine, opts) {
@@ -572,6 +623,8 @@ function startWsPusher() {
   setInterval(async () => {
     if (!wsUp || !ws || ws.readyState !== 1) return;
     try {
+      // WebSocket 实时通道独立刷新 Importer 运营数据，不等待 30 秒心跳。
+      await pollCollectorApis();
       const [hermesHealth, core] = await Promise.all([
         _httpGetJSON(CONFIG.hermesUrl + '/health', 1500).catch(() => null),
         _httpGetJSON(CONFIG.importerUrl + '/api/core/health', 2500).catch(() => null),
@@ -920,8 +973,8 @@ const healthServer = http.createServer((req, res) => {
     res.end(JSON.stringify(buildPayload()));
   } else if (req.method === 'POST' && req.url && req.url.startsWith('/stop-collector')) {
     req.resume();
-    const token = req.headers['x-edge-token'] || '';
-    if (!CONFIG.edgeToken || token !== CONFIG.edgeToken) {
+    const armToken = req.headers['x-edge-token'] || '';
+    if (!CONFIG.edgeToken || armToken !== CONFIG.edgeToken) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
       return;
@@ -964,6 +1017,15 @@ const healthServer = http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: false, error: e.message }));
       }
     })();
+  } else if (req.method === 'POST' && req.url && req.url.startsWith('/quest-control')) {
+    const token = req.headers['x-edge-token'] || '';
+    if (!CONFIG.edgeToken || token !== CONFIG.edgeToken) { res.writeHead(401, {'Content-Type':'application/json'}); res.end(JSON.stringify({ok:false,error:'unauthorized'})); return; }
+    let raw=''; req.on('data', c => { raw += c; }); req.on('end', async () => {
+      try { const action = String((JSON.parse(raw || '{}')).action || ''); if (!['connect','disconnect'].includes(action)) throw new Error('无效操作');
+        const cmd = action === 'connect' ? 'adb shell monkey -p com.picoar.questctrlpose 1' : 'adb shell am force-stop com.picoar.questctrlpose';
+        const r = await _execAsync(cmd, {timeout:30000}); res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify({ok:true, action, output:(r.stdout||'').trim()}));
+      } catch(e) { res.writeHead(500, {'Content-Type':'application/json'}); res.end(JSON.stringify({ok:false,error:e.message})); }
+    });
   } else if (req.method === 'GET' && req.url && req.url.startsWith('/machine-config')) {
     req.resume();
     const token = req.headers['x-edge-token'] || '';
@@ -1384,6 +1446,40 @@ print("===HANDS:"+json.dumps(safe_val(hands), ensure_ascii=False))`;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, progress: diagStatus }));
   } else if (req.method === 'POST' && req.url && req.url.startsWith('/arm-control')) {
+    // Forward arm commands to the persistent SDK broker in importer.  This
+    // branch intentionally returns before the legacy one-shot implementation
+    // below, which is kept only for backwards source compatibility.
+    const token = req.headers['x-edge-token'] || '';
+    if (!CONFIG.edgeToken || token !== CONFIG.edgeToken) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, sdkCalled: false, error: 'unauthorized' }));
+      return;
+    }
+    let armRaw = '';
+    req.on('data', chunk => {
+      armRaw += chunk;
+      if (armRaw.length > 16384) req.destroy();
+    });
+    req.on('end', async () => {
+      let payload = {};
+      try { payload = JSON.parse(armRaw || '{}'); } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, sdkCalled: false, error: '请求参数不是有效 JSON' }));
+        return;
+      }
+      try {
+        const result = await runArmBrokerCommand(payload, 35000);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: false, sdkCalled: false, error: error.message }));
+      }
+    });
+    return;
+
+    /* Legacy one-shot implementation (unreachable; retained temporarily). */
+    {
     req.resume();
     const token = req.headers['x-edge-token'] || '';
     if (!CONFIG.edgeToken || token !== CONFIG.edgeToken) {
@@ -1400,7 +1496,7 @@ print("===HANDS:"+json.dumps(safe_val(hands), ensure_ascii=False))`;
         const action = body.action || '';
         const arm = (body.arm || 'A').toUpperCase();
         const state = parseInt(body.state, 10);
-        const validActions = ['set_state','clear_error','soft_stop','get_errors','disable'];
+        const validActions = ['connect','disconnect','exit','set_state','clear_error','soft_stop','get_errors','disable','set_joint_mode','set_impedance_joint','set_impedance_cart','joint_drag','cart_drag','exit_drag','set_tool'];
         if (!validActions.includes(action)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: '无效操作，支持: ' + validActions.join(', ') }));
@@ -1626,6 +1722,7 @@ print("===ARM:" + json.dumps(result, ensure_ascii=False))
         res.end(JSON.stringify({ ok: false, error: e.message }));
       });
     });
+    }
   } else {
     res.writeHead(404);
     res.end('Not Found');

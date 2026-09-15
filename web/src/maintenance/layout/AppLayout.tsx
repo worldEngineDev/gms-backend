@@ -16,7 +16,6 @@ import { useAuthStore, isAdmin, isSuperAdmin } from '@common/stores/auth';
 import { useUIStore } from '@common/stores/ui';
 import { useInventoryConfig } from '@common/hooks/useData';
 import { getNotifications, getServerLoad } from '@common/api';
-import { DeployAdminModal } from '../modules/deploy-admin/DeployAdminModal';
 import { ChatWidget } from '../modules/chat/ChatWidget';
 import { GlobalSearch } from './GlobalSearch';
 import { getCookie, setCookie } from '@common/utils/cookies';
@@ -35,8 +34,6 @@ export function AppLayout() {
   const { token } = theme.useToken();
   const inventoryConfig = useInventoryConfig();
 
-  const [deployOpen, setDeployOpen] = useState(false);
-  const [brandClickCount, setBrandClickCount] = useState(0);
   const [notifCount, setNotifCount] = useState(0);
   const [serverInfo, setServerInfo] = useState<string>('离线');
   const [clock, setClock] = useState('');
@@ -72,18 +69,6 @@ export function AppLayout() {
     const t = setInterval(refresh, 10000);
     return () => clearInterval(t);
   }, [location.pathname]);
-
-  // 快捷键：Ctrl+Shift+D 部署管理（旧版保留）
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key === 'D') {
-        e.preventDefault();
-        setDeployOpen(true);
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, []);
 
   // 侧边栏设备下拉选项（默认三组 + 自定义库存类型）
   const deviceOptions = useMemo(() => {
@@ -177,27 +162,24 @@ export function AppLayout() {
   ];
 
   return (
-    <Layout style={{ height: '100vh' }}>
+    <Layout className="gms-shell" style={{ height: '100vh' }}>
       <Sider
         collapsible
         collapsed={collapsed}
         onCollapse={setCollapsed}
+        breakpoint="lg"
+        collapsedWidth={0}
+        onBreakpoint={setCollapsed}
         trigger={null}
         width={230}
         style={{ background: token.colorBgContainer, borderRight: `1px solid ${token.colorBorderSecondary}`, overflow: 'hidden' }}
       >
         <div
-          onClick={() => {
-            const n = brandClickCount + 1;
-            setBrandClickCount(n);
-            if (n >= 5) { setDeployOpen(true); setBrandClickCount(0); }
-          }}
           style={{
             height: 56, display: 'flex', alignItems: 'center', gap: 10, padding: '0 16px',
             cursor: 'pointer', fontWeight: 700, fontSize: 16, whiteSpace: 'nowrap', overflow: 'hidden',
             borderBottom: `1px solid ${token.colorBorderSecondary}`,
           }}
-          title="连续点击5次打开部署管理"
         >
           <img src="/icons/logo-we.png" alt="logo" style={{ width: 32, height: 32, borderRadius: 8, flexShrink: 0 }} />
         </div>
@@ -235,8 +217,8 @@ export function AppLayout() {
           </Button>
         </div>
       </Sider>
-      <Layout>
-        <Header style={{
+      <Layout className="gms-shell-main">
+        <Header className="gms-shell-header" style={{
           background: token.colorBgContainer, padding: '0 16px', height: 56,
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           borderBottom: `1px solid ${token.colorBorderSecondary}`,
@@ -251,7 +233,7 @@ export function AppLayout() {
           </Space>
           <Space size={12}>
             <Tooltip title="服务器连接状态">
-              <span style={{
+              <span className="gms-shell-health-dot" style={{
                 width: 10, height: 10, borderRadius: '50%', display: 'inline-block',
                 background: healthOk ? '#22c55e' : '#ef4444',
               }} />
@@ -283,15 +265,14 @@ export function AppLayout() {
                 <span style={{ fontSize: 13 }}>{user?.username}</span>
               </Space>
             </Dropdown>
-            <Tag color={healthOk ? 'green' : 'red'} style={{ margin: 0 }}>{serverInfo}</Tag>
-            <span style={{ fontSize: 12, opacity: 0.6, fontVariantNumeric: 'tabular-nums' }}>{clock}</span>
+            <Tag className="gms-shell-server" color={healthOk ? 'green' : 'red'} style={{ margin: 0 }}>{serverInfo}</Tag>
+            <span className="gms-shell-clock" style={{ fontSize: 12, opacity: 0.6, fontVariantNumeric: 'tabular-nums' }}>{clock}</span>
           </Space>
         </Header>
-        <Content style={{ overflowY: 'auto', background: token.colorBgLayout }}>
+        <Content className="gms-shell-content" style={{ overflowY: 'auto', background: token.colorBgLayout }}>
           <Outlet />
         </Content>
       </Layout>
-      <DeployAdminModal open={deployOpen} onClose={() => setDeployOpen(false)} />
       <ChatWidget />
     </Layout>
   );

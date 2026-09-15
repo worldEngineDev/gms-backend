@@ -55,9 +55,9 @@ describe('createRateLimiter', () => {
   });
 
   describe('用户限流', () => {
-    test('默认 60 阈值：第 60 次放行，第 61 次拒绝', async () => {
+    test('默认 300 阈值：第 300 次放行，第 301 次拒绝', async () => {
       const rl = createRateLimiter({ redisClient: mockRedis() });
-      for (let i = 0; i < 60; i++) {
+      for (let i = 0; i < 300; i++) {
         const r = await rl.checkUserLimit('user-1');
         assert.strictEqual(r.allowed, true);
       }

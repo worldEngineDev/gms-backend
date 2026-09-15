@@ -15,12 +15,14 @@
 /* CSS Variables */
 :root {
   --bg: #ffffff;
-  --surface: #f8f9fa;
-  --surface2: #f1f3f5;
-  --text: #0a0a0a;
-  --text2: #525252;
-  --text3: #a1a1a1;
-  --border: #e5e5e5;
+  --surface: #f3f6f8;
+  --surface2: #e9edf2;
+  --text: #152238;
+  --text2: #556579;
+  --text3: #8a98a9;
+  --border: #dce5ec;
+  --brand: #153a5b;
+  --accent: #e66a4e;
   --mono: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
   --sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   --radius: 12px;
@@ -32,7 +34,7 @@
 
 body {
   font-family: var(--sans);
-  background: #f5f5f7;
+  background: var(--surface);
   color: var(--text);
   min-height: 100vh;
   padding-bottom: calc(24px + env(safe-area-inset-bottom));
@@ -43,7 +45,7 @@ body {
 
 /* Header */
 .header {
-  background: #0a0a1a;
+  background: var(--brand);
   padding: 32px 20px 28px;
   padding-top: calc(32px + env(safe-area-inset-top));
   color: white;
@@ -73,6 +75,7 @@ body {
   border-radius: var(--radius);
   padding: 20px;
   margin-bottom: 12px;
+  box-shadow: 0 4px 16px rgba(21,58,91,.06);
 }
 .card-label {
   font-family: var(--mono);
@@ -229,10 +232,10 @@ body {
 }
 .btn:active { opacity: 0.7; transform: scale(0.98); }
 .btn:last-child { margin-bottom: 0; }
-.btn-primary { background: #0a0a0a; color: white; }
-.btn-danger { background: #be123c; color: white; }
-.btn-success { background: #047857; color: white; }
-.btn-warning { background: #0a0a0a; color: white; }
+.btn-primary { background: var(--brand); color: white; }
+.btn-danger { background: var(--accent); color: white; }
+.btn-success { background: #16866b; color: white; }
+.btn-warning { background: var(--brand); color: white; }
 .btn-outline {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -273,6 +276,6 @@ body {
   background: var(--bg);
   transition: border-color 0.15s;
 }
-.input:focus { outline: none; border-color: #0a0a0a; }
+.input:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(21,58,91,.12); }
 textarea.input { min-height: 80px; resize: vertical; font-family: var(--sans); }
 .form-error { color: #be123c; font-size: 0.75rem; text-align: center; margin-bottom: 10px; min-height: 18px; font-weight: 500; }

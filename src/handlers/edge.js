@@ -324,7 +324,11 @@ module.exports = function createEdgeHandlers(deps) {
     }
     if (collector && hasOwn(collector, 'hermes') && collector.hermes) {
       const hermes = collector.hermes;
-      if (hermes.reachable === false) {
+      const importer = collector.importer || {};
+      const collectorInactive = importer.collectorAlive === false
+        || importer.is_collector_alive === false
+        || importer.health?.is_collector_alive === false;
+      if (hermes.reachable === false && !collectorInactive) {
         alerts.push({ level: 'error', code: 'hermes_unreachable', message: `Hermes API 不可达${hermes.error ? `：${hermes.error}` : ''}` });
       }
       const health = hermes.health || {};

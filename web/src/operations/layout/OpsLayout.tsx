@@ -161,9 +161,11 @@ export function OpsLayout() {
   };
 
   const pageAllowed = !isPlainUser || USER_ALLOWED.includes(location.pathname);
+  const isOverwatchHome = location.pathname === '/';
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout className={`gms-shell${isOverwatchHome ? ' ops-overwatch-shell' : ''}`} style={{ minHeight: '100vh' }}>
+      {!isOverwatchHome && (
       <Sider
         theme={theme === 'dark' ? 'dark' : 'light'}
         collapsed={collapsed}
@@ -257,9 +259,11 @@ export function OpsLayout() {
         </div>
         </div>
       </Sider>
+      )}
 
-      <Layout>
-        <Header style={{
+      <Layout className="gms-shell-main">
+        {!isOverwatchHome && (
+        <Header className="gms-shell-header" style={{
           background: token.colorBgContainer, padding: '0 16px', height: 56,
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           borderBottom: `1px solid ${token.colorBorderSecondary}`,
@@ -274,7 +278,7 @@ export function OpsLayout() {
           </Flex>
           <Flex align="center" gap={10}>
             <Tooltip title={online ? '服务器已连接' : '服务器未连接'}>
-              <span style={{
+              <span className="gms-shell-health-dot" style={{
                 width: 10, height: 10, borderRadius: '50%', display: 'inline-block',
                 background: online ? '#22c55e' : '#ef4444',
               }} />
@@ -299,17 +303,18 @@ export function OpsLayout() {
                 <span style={{ fontSize: 13 }}>{user?.displayName || user?.username || '--'}</span>
               </Space>
             </Dropdown>
-            <Tag color={online ? 'green' : 'red'} style={{ margin: 0 }}>
+            <Tag className="gms-shell-server" color={online ? 'green' : 'red'} style={{ margin: 0 }}>
               {online ? `${{ idle: '空闲', smooth: '流畅', busy: '繁忙', full: '满载' }[status?.loadLevel as string] || ''} ${status?.onlineUsers ?? 0}人` : '离线'}
             </Tag>
-            <span style={{ fontSize: 12, opacity: 0.6, fontVariantNumeric: 'tabular-nums' }}>{clock}</span>
+            <span className="gms-shell-clock" style={{ fontSize: 12, opacity: 0.6, fontVariantNumeric: 'tabular-nums' }}>{clock}</span>
             <Tooltip title="修改密码">
               <Button type="text" size="small" icon={<KeyOutlined />} onClick={() => setPwdOpen(true)} />
             </Tooltip>
           </Flex>
         </Header>
+        )}
 
-        <Content style={{ overflow: 'auto' }}>
+        <Content className="gms-shell-content" style={{ overflow: isOverwatchHome ? 'hidden' : 'auto' }}>
           {pageAllowed ? (
             <Outlet />
           ) : (

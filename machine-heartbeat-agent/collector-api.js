@@ -28,14 +28,24 @@ function normalizeImporterMachine(config) {
   const storage = source.storage || {};
   const cameras = source.cameras && typeof source.cameras === 'object' ? source.cameras : {};
   const gello = commander.gello && typeof commander.gello === 'object' ? commander.gello : {};
+  const robots = source.robot && typeof source.robot === 'object' ? source.robot : {};
+  const machineId = stringOrNull(misc.machine_id);
+  const configNames = [...Object.keys(gello), ...Object.keys(robots)];
+  const machineType = String(commander.unit || '').toLowerCase() === 'iris'
+    || /iris/i.test(machineId || '')
+    || configNames.some(name => /wuji_hand|marvin|dexterous/i.test(name))
+    ? 'dexterous'
+    : configNames.some(name => /wuji_glove|glove/i.test(name)) ? 'glove_only' : null;
 
   return {
-    machineId: stringOrNull(misc.machine_id),
+    machineId,
+    machineType,
     computerId: stringOrNull(misc.computer_id),
     collectorType: stringOrNull(collector.type),
     workflow: stringOrNull(collector.workflow),
     commanderUnit: stringOrNull(commander.unit),
     gloveSlots: Object.keys(gello),
+    robotSlots: Object.keys(robots),
     cameraIds: Object.keys(cameras),
     cameras: Object.fromEntries(Object.entries(cameras).map(([id, value]) => {
       const item = value && typeof value === 'object' ? value : {};
@@ -196,15 +206,50 @@ class CollectorApiPoller {
     this.snapshot = { importer: null, hermes: null };
   }
 
+  async requestImporter(paths) {
+    const candidates = Array.isArray(paths) ? paths : [paths];
+    let lastError;
+    for (const path of candidates) {
+      try {
+        const response = await this.request(joinUrl(this.importerUrl, path), {
+          timeout: this.timeout,
+          includeEdgeAuth: false,
+        });
+        return { ...response, endpoint: path };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error('Importer API 请求失败');
+  }
+
   async pollImporter() {
     const checkedAt = new Date().toISOString();
     const previous = this.snapshot.importer || {};
-    const [machineResult, taskResult, coreResult] = await Promise.allSettled([
-      this.request(joinUrl(this.importerUrl, '/api/config/machine'), { timeout: this.timeout, includeEdgeAuth: false }),
-      this.request(joinUrl(this.importerUrl, '/api/config/task'), { timeout: this.timeout, includeEdgeAuth: false }),
-
-      this.request(joinUrl(this.importerUrl, '/api/core/health'), { timeout: this.timeout, includeEdgeAuth: false }),
+    const names = ['machine', 'task', 'health', 'workers', 'queue', 'processing', 'processor', 'episodes', 'recentEpisodes', 'overview'];
+    const settled = await Promise.allSettled([
+      this.requestImporter('/api/config/machine'),
+      this.requestImporter('/api/config/task'),
+      this.requestImporter(['/api/maintenance/health', '/api/core/health']),
+      this.requestImporter('/api/data/processing/workers/status'),
+      this.requestImporter('/api/data/processing/process_queue/status'),
+      this.requestImporter(['/api/data/processing/overview', '/api/data/processing/overall']),
+      this.requestImporter('/api/processor/overview'),
+      this.requestImporter('/api/data/episodes/records'),
+      this.requestImporter('/api/processor/episodes/recent'),
+      this.requestImporter('/api/operations/overview'),
     ]);
+    const results = Object.fromEntries(names.map((name, index) => [name, settled[index]]));
+    const machineResult = results.machine;
+    const taskResult = results.task;
+    const coreResult = results.health;
+    const workersResult = results.workers;
+    const queueResult = results.queue;
+    const processingResult = results.processing;
+    const processorResult = results.processor;
+    const episodesResult = results.episodes;
+    const recentEpisodesResult = results.recentEpisodes;
+    const overviewResult = results.overview;
     const machineOk = machineResult.status === 'fulfilled';
     const taskOk = taskResult.status === 'fulfilled';
     const coreOk = coreResult.status === 'fulfilled';
@@ -213,20 +258,25 @@ class CollectorApiPoller {
       reachable: machineOk || taskOk,
       checkedAt,
       lastSuccessAt: machineOk || taskOk ? checkedAt : (previous.lastSuccessAt || null),
-      endpointStatus: { machine: machineOk, task: taskOk, core: coreOk },
-      endpointErrors: {
-        machine: machineOk ? null : errorMessage(machineResult.reason),
-        task: taskOk ? null : errorMessage(taskResult.reason),
-        core: coreOk ? null : errorMessage(coreResult.reason),
-      },
+      endpointStatus: Object.fromEntries(names.map(name => [name, results[name].status === 'fulfilled'])),
+      endpointErrors: Object.fromEntries(names.map(name => [name, results[name].status === 'fulfilled' ? null : errorMessage(results[name].reason)])),
+      endpointPaths: Object.fromEntries(names.map(name => [name, results[name].status === 'fulfilled' ? results[name].value.endpoint : null])),
       machineConfigStale: !machineOk,
       taskStale: !taskOk,
       stale: !(machineOk || taskOk),
     };
     if (machineOk) Object.assign(next, normalizeImporterMachine(machineResult.value.body));
     if (taskOk) next.task = normalizeImporterTask(taskResult.value.body);
+    if (workersResult.status === 'fulfilled') next.workers = workersResult.value.body;
+    if (queueResult.status === 'fulfilled') next.queue = queueResult.value.body;
+    if (processingResult.status === 'fulfilled') next.processing = processingResult.value.body;
+    if (processorResult.status === 'fulfilled') next.processorOverview = processorResult.value.body;
+    if (episodesResult.status === 'fulfilled') next.episodes = episodesResult.value.body;
+    if (recentEpisodesResult.status === 'fulfilled') next.recentEpisodes = recentEpisodesResult.value.body;
+    if (overviewResult.status === 'fulfilled') next.overview = overviewResult.value.body;
     if (coreOk) {
       const core = coreResult.value.body && typeof coreResult.value.body === 'object' ? coreResult.value.body : {};
+      next.health = core;
       next.importerVersion = stringOrNull(core.version);
       next.channel = stringOrNull(core.channel);
       next.activity = stringOrNull(core.activity);
@@ -235,6 +285,13 @@ class CollectorApiPoller {
       next.loggedIn = boolOrNull(core.is_logged_in);
       next.idleTimeSecs = numberOrNull(core.idle_time_secs);
     }
+    const overview = next.overview && typeof next.overview === 'object' ? next.overview : {};
+    next.quality = overview.quality && typeof overview.quality === 'object' ? overview.quality : null;
+    next.qualityPassRate = numberOrNull(overview.quality_pass_rate);
+    next.latestMcapReport = overview.latest_mcap_report || null;
+    next.recentMcapReports = Array.isArray(overview.recent_mcap_reports) ? overview.recent_mcap_reports : [];
+    next.recentFailures = Array.isArray(overview.recent_failures) ? overview.recent_failures : [];
+    next.faults = overview.faults && typeof overview.faults === 'object' ? overview.faults : {};
     if (!machineOk && !taskOk) next.error = 'Importer API 不可达';
     else next.error = null;
     this.snapshot.importer = next;

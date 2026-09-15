@@ -10,6 +10,7 @@ const BUSINESS_EVENTS = [
   'group_transfer_updated', 'ops_orders_updated', 'ops_customers_updated',
   'ops_production_updated', 'audit_log_updated', 'storage_locations_updated',
   'machine_bindings_updated', 'machine_presence_updated',
+  'machine_live_updated',
 ];
 
 let es: EventSource | null = null;
@@ -100,9 +101,10 @@ export function startSSE(): void {
     checkVersion();
     versionTimer = setInterval(checkVersion, 5 * 60 * 1000);
   }
-  // 兜底：30 秒静默刷新当前活跃查询（替代旧版 autoRefresh）
+  // 兜底：仅低频刷新当前活跃查询。正常情况下数据由 SSE 事件驱动，
+  // 过于频繁地全量失效会让每个在线页面同时请求 /api/sync，造成前端卡顿。
   if (!safetyTimer) {
-    safetyTimer = setInterval(() => { queryClient.invalidateQueries(); }, 30000);
+    safetyTimer = setInterval(() => { queryClient.invalidateQueries(); }, 120000);
   }
 }
 

@@ -1,4 +1,4 @@
-// PM2 Ecosystem Configuration — 3-Instance Load Balanced
+// PM2 Ecosystem Configuration - Single Instance
 // 使用方法: pm2 start ecosystem.config.js
 //
 // S1 安全加固: 密钥不再硬编码，从 .env / process.env 读取。
@@ -6,7 +6,7 @@
 //   - 缺失关键密钥时 PM2 启动会报错（fail fast），避免误用空值连库
 require('dotenv').config();
 
-// 三个实例共享的公共环境（仅 PORT 和日志文件按实例区分）
+// 单实例公共环境
 const sharedEnv = {
   NODE_ENV: 'production',
   TZ: 'Asia/Shanghai',
@@ -17,6 +17,7 @@ const sharedEnv = {
   DB_NAME: process.env.DB_NAME || 'gms',
   REDIS_HOST: process.env.REDIS_HOST || '127.0.0.1',
   REDIS_PORT: process.env.REDIS_PORT || '6379',
+  EDGE_TOKEN: process.env.EDGE_TOKEN,
   // 加密密钥（encryptPassword 用，S6 批次会改用随机 IV）
   ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
   // HTTPS 标志（控制是否下发 HSTS）
@@ -30,23 +31,20 @@ if (!sharedEnv.DB_PASSWORD) {
   process.exit(1);
 }
 
-// 按端口生成 3 个 fork 实例（端口 8765/8766/8767）
-const ports = [8765, 8766, 8767];
-const apps = ports.map(port => {
-  const idx = ports.indexOf(port) + 1;
-  return {
-    name: `yunwei-${idx}`,
+const apps = [
+  {
+    name: 'yunwei-1',
     script: 'server.js',
     instances: 1,
     exec_mode: 'fork',
     node_args: '--expose-gc',
     max_memory_restart: '2G',
     kill_timeout: 10000,
-    env: { ...sharedEnv, PORT: String(port) },
-    error_file: `/tmp/yunwei-${idx}-error.log`,
-    out_file: `/tmp/yunwei-${idx}-out.log`,
+    env: { ...sharedEnv, PORT: '8765' },
+    error_file: '/tmp/yunwei-1-error.log',
+    out_file: '/tmp/yunwei-1-out.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
-  };
-});
+  },
+];
 
 module.exports = { apps };

@@ -1,6 +1,6 @@
 {
   "name": "machine-heartbeat-agent",
-  "version": "1.3.2",
+  "version": "1.3.6",
   "description": "GMS机器心跳监控代理 - 部署在每台主机上，自动向运维系统报告在线状态",
   "main": "heartbeat-agent.js",
   "scripts": {

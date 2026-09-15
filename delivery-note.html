@@ -6,8 +6,8 @@
 <title>送货单</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
-  body { font-family:"SimSun","Songti SC","STSong","Microsoft YaHei",serif; background:#eef0f2; color:#111; font-size:14px; }
-  .print-area { width:210mm; min-height:297mm; margin:20px auto; background:#fff; padding:10mm 12mm 10mm; box-shadow:0 2px 12px rgba(0,0,0,.12); position:relative; }
+  body { font-family:"SimSun","Songti SC","STSong","Microsoft YaHei",serif; background:#f3f6f8; color:#152238; font-size:14px; }
+  .print-area { width:210mm; min-height:297mm; margin:20px auto; background:#fff; padding:10mm 12mm 10mm; box-shadow:0 8px 28px rgba(21,58,91,.12); position:relative; border-radius:10px; }
 
   /* 标题 */
   .title-row { text-align:center; margin-bottom:6mm; }
@@ -47,13 +47,13 @@
   /* 工具栏 */
   .toolbar { position:fixed; top:16px; right:16px; z-index:1000; display:flex; gap:8px; }
   .toolbar button { padding:10px 22px; font-size:14px; border:none; border-radius:6px; cursor:pointer; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,.2); }
-  .btn-print { background:#1a73e8; color:#fff; }
+  .btn-print { background:#153a5b; color:#fff; }
   .btn-back { background:#fff; color:#333; border:1px solid #ccc !important; }
 
   @media print {
     @page { size:A4 portrait; margin:0; }
     body { background:#fff; }
-    .print-area { margin:0; box-shadow:none; }
+    .print-area { margin:0; box-shadow:none; border-radius:0; }
     .toolbar { display:none !important; }
   }
   @media screen and (max-width: 600px) {

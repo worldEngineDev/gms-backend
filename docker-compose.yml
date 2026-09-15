@@ -120,6 +120,7 @@ services:
       DB_NAME: gms
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      EDGE_TOKEN: ${EDGE_TOKEN:?EDGE_TOKEN required for machine agents}
       FEISHU_APP_ID: ${FEISHU_APP_ID:-cli_aaa42355f0389cfc}
       FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:?FEISHU_APP_SECRET required (set in .env)}
       # SZX3 多维表格 + 运维通知群机器人

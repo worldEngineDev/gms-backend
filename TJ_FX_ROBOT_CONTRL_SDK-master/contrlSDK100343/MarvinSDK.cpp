@@ -256,6 +256,11 @@ bool OnGetBuf(DCSS *ret)
 	return CRobot::OnGetBuf(ret);
 }
 
+unsigned long long OnGetFrameGeneration()
+{
+	return CRobot::OnGetFrameGeneration();
+}
+
 bool OnStartGather(long targetNum, long targetID[35], long recordNum)
 {
 	if (targetNum < 0)

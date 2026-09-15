@@ -69,11 +69,22 @@ export default function MachinesPage() {
   const boundSN = (num: string, hand: 'left' | 'right') =>
     registry.find(r => r.machineNumber === num && r.handType === hand && r.status === 'in_use');
 
+  const equipmentTypeOf = (machine: any) => {
+    const type = String(machine?.machineType || '').toLowerCase();
+    if (type === 'dexterous') return 'dexterous';
+    if (type === 'glove_only') return 'glove';
+    return machine?.deviceType || '';
+  };
+
   const collectorMeta = (machine: any) => {
     const hermes = machine?.hermes;
     const importer = machine?.importer;
     if (machine?.hostOnline === false) {
       return { color: 'red', icon: <DisconnectOutlined />, text: '采集代理离线' };
+    }
+    if (machine?.collectorStarted === false || machine?.edgeContainerRoleStatus?.collector?.running === false
+      || machine?.containerRoleStatus?.collector?.running === false) {
+      return { color: 'default', icon: <DisconnectOutlined />, text: '采集程序未运行' };
     }
     if (!hermes && !importer) {
       return { color: 'default', icon: <DisconnectOutlined />, text: '未连接采集代理' };
@@ -162,7 +173,7 @@ export default function MachinesPage() {
 
   const renderCard = (num: string) => {
     const m = latestMap[num];
-    const meta = eqMeta(m.deviceType);
+    const meta = eqMeta(equipmentTypeOf(m));
     const leftSN = boundSN(num, 'left');
     const rightSN = boundSN(num, 'right');
     return (
@@ -229,7 +240,7 @@ export default function MachinesPage() {
 
   const columns: any[] = [
     { title: '机器编号', dataIndex: 'machineNumber', render: (_: any, r: any) => <a onClick={() => setDetailNumber(r.machineNumber)}><strong>{r.machineNumber}</strong></a> },
-    { title: '设备类型', dataIndex: 'deviceType', render: (v: string) => { const meta = eqMeta(v); return `${meta.icon} ${meta.label}`; } },
+    { title: '设备类型', dataIndex: 'deviceType', render: (_v: string, r: any) => { const meta = eqMeta(equipmentTypeOf(r)); return `${meta.icon} ${meta.label}`; } },
     { title: '状态', dataIndex: 'machineNumber', key: 'status', render: (num: string) => statusTag(num) },
     {
       title: '主机在线', key: 'host',
@@ -331,10 +342,10 @@ export default function MachinesPage() {
         {detailMachine && (
           <div>
             <Flex align="center" gap={14} style={{ marginBottom: 16, paddingBottom: 12, borderBottom: '1px solid rgba(128,128,128,0.15)' }}>
-              <div style={{ fontSize: 40 }}>{eqMeta(detailMachine.deviceType).icon}</div>
+              <div style={{ fontSize: 40 }}>{eqMeta(equipmentTypeOf(detailMachine)).icon}</div>
               <div>
                 <div style={{ fontSize: 22, fontWeight: 700 }}>#{detailNumber}</div>
-                <div style={{ opacity: 0.65, fontSize: 13 }}>{eqMeta(detailMachine.deviceType).label}</div>
+                <div style={{ opacity: 0.65, fontSize: 13 }}>{eqMeta(equipmentTypeOf(detailMachine)).label}</div>
               </div>
               <div style={{ marginLeft: 'auto' }}>{statusTag(detailNumber!)}</div>
             </Flex>
@@ -361,7 +372,7 @@ export default function MachinesPage() {
                 <div style={{ marginTop: 18, marginBottom: 8, fontWeight: 600 }}>采集程序</div>
                 {!detailMachine.importer && !detailMachine.hermes && (
                   <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 10 }}>
-                    尚未收到采集代理心跳；请在该采集机部署并启动 machine-heartbeat-agent。
+                    尚未收到 Agent 实时快照；请检查目标机 Agent 和网络配置。
                   </Typography.Text>
                 )}
                 <Row gutter={[12, 8]} style={{ fontSize: 13 }}>

@@ -129,8 +129,8 @@ module.exports = function createAuthHandlers(deps) {
 
     if (user.status === 'disabled') return sendJSON(res, { error: '账户已被禁用，请联系管理员' }, 403);
 
-    if (user.system !== 'maintenance') {
-      return sendJSON(res, { error: '仅运维系统用户可使用此功能' }, 403);
+    if (user.system !== 'maintenance' && user.system !== 'operations') {
+      return sendJSON(res, { error: '仅运维或运营系统用户可使用此功能' }, 403);
     }
 
     // 仅失效相同来源（mobile）的旧会话，保留浏览器会话 — 让微信链接页与浏览器可共存
@@ -144,6 +144,7 @@ module.exports = function createAuthHandlers(deps) {
 
     const token = await createToken({ ...user }, 'mobile');
 
+    const secureFlag = isHttps && isHttps(req) ? '; Secure' : '';
     sendJSON(res, {
       success: true,
       token,
@@ -154,7 +155,14 @@ module.exports = function createAuthHandlers(deps) {
         role: user.role,
         system: user.system || 'maintenance'
       }
-    }, 200);
+    }, 200, req, {
+      // Keep a browser session as a durable fallback for mobile WebViews.
+      // Bearer auth remains the primary client-side path.
+      'Set-Cookie': [
+        `gms_token=${token}; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly${secureFlag}`,
+        `gms_mobile_token=${token}; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly${secureFlag}`,
+      ],
+    });
   }
 
   async function handleTokenVerify(req, res, body) {

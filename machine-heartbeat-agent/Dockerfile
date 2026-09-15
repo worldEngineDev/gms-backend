@@ -18,6 +18,7 @@ RUN apk add --no-cache gcompat docker-cli v4l-utils ffmpeg wget unzip python3 py
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY *.js ./
+COPY marvin-sdk-broker.py ./
 # Marvin 机械臂 SDK 动态库（glibc，通过 docker cp 传入 importer 容器执行）
 COPY libMarvinSDK.so ./
 

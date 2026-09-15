@@ -555,6 +555,15 @@ bool CRobot::OnGetBuf(DCSS *ret)
 	return true;
 }
 
+unsigned long long CRobot::OnGetFrameGeneration()
+{
+	if (m_InsRobot == NULL)
+	{
+		return 0;
+	}
+	return m_InsRobot->m_frame_generation.load();
+}
+
 bool CRobot::OnLinkTo(FX_UCHAR ip1, FX_UCHAR ip2, FX_UCHAR ip3, FX_UCHAR ip4)
 {
 	GetIns();
@@ -562,6 +571,7 @@ bool CRobot::OnLinkTo(FX_UCHAR ip1, FX_UCHAR ip2, FX_UCHAR ip3, FX_UCHAR ip4)
 	{
 		return false;
 	}
+	m_InsRobot->m_frame_generation.store(0);
 #ifdef CMPL_WIN
 	WSADATA wsadata;
 	int ret;
@@ -1512,6 +1522,7 @@ void CRobot::DoRecv()
 				{
 					std::lock_guard<std::mutex> lk(m_dcss_mutex);
 					memcpy(&m_DCSS, p, sizeof(m_DCSS));
+					m_frame_generation.fetch_add(1);
 				}
 				m_send_response_recv_tag = m_DCSS.m_Out[0].m_pad[0];
 				if (m_InsRobot->m_GatherTag == 1)

@@ -458,7 +458,7 @@ module.exports = function createTechSupportHandlers(deps) {
     let detailedDescription = `【系统自动检测】${machineNumber || ''} ${faultDescription}`;
 
     // 诊断详情（仅 SN 冲突类告警会产生这段）
-    if (diagnostics) {
+    if (diagnostics && alertCode !== 'unregistered_sn') {
       const diagLines = [];
       if (diagnostics.observedSN) diagLines.push(`观测SN ${diagnostics.observedSN}`);
       if (diagnostics.registeredSN) diagLines.push(`登记SN ${diagnostics.registeredSN}`);
@@ -494,7 +494,7 @@ module.exports = function createTechSupportHandlers(deps) {
     if (alertContext) {
       if (alertContext.possibleCause) detailedDescription += `\n可能原因: ${alertContext.possibleCause}`;
       if (alertContext.suggestedAction) detailedDescription += `\n建议操作: ${alertContext.suggestedAction}`;
-      if (alertContext.relatedAlerts && alertContext.relatedAlerts.length > 0) {
+      if (alertContext.relatedAlerts && alertContext.relatedAlerts.length > 0 && alertCode !== 'unregistered_sn') {
         detailedDescription += `\n相关告警: ${alertContext.relatedAlerts.join('、')}`;
       }
     }
@@ -542,10 +542,15 @@ module.exports = function createTechSupportHandlers(deps) {
     await _updateMachineStatusByNumber(machineNumber, 'waiting_repair');
     // 生产状态联动：告警自动建单 → 待维修
     if (typeof setProductionStatus === 'function') {
-      setProductionStatus({
-        machineNumber, status: 'waiting_repair', source: 'ticket',
-        ticketId: id, reason: `告警自动建单：${faultType}`,
-      }).catch(e => console.error('[Production Status] 自动单联动失败:', e.message));
+      try {
+        // 等待状态写入完成，避免同一心跳中的“开始录制”状态更新发生竞态。
+        await setProductionStatus({
+          machineNumber, status: 'waiting_repair', source: 'ticket',
+          ticketId: id, reason: `告警自动建单：${faultType}`,
+        });
+      } catch (e) {
+        console.error('[Production Status] 自动单联动失败:', e.message);
+      }
     }
     broadcastChange('tech_support', ['machines'], { action: 'created', id, auto: true });
     setImmediate(() => {
@@ -604,11 +609,16 @@ module.exports = function createTechSupportHandlers(deps) {
       await saveTechSupport(row.id, item);
       closed++;
       await _recomputeMachineStatusFromGloves(machineNumber);
+      // 录制恢复代表机器已投入生产；等待写入完成，避免被后续心跳覆盖。
       if (typeof setProductionStatus === 'function') {
-        setProductionStatus({
-          machineNumber, status: 'ready', source: 'ticket',
-          ticketId: row.id, reason: '机器恢复录制，自动完成采集故障工单',
-        }).catch(e => console.error('[Production Status] 录制恢复联动失败:', e.message));
+        try {
+          await setProductionStatus({
+            machineNumber, status: 'in_production', source: 'recording',
+            ticketId: row.id, reason: '机器开始录制，自动完成采集故障工单并进入生产',
+          });
+        } catch (e) {
+          console.error('[Production Status] 录制恢复联动失败:', e.message);
+        }
       }
       broadcastChange('tech_support', ['machines', 'sn_registry', 'inventory'], { action: 'completed', id: row.id });
       setImmediate(() => {

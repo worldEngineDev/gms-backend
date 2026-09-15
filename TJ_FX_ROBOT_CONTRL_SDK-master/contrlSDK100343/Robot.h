@@ -49,6 +49,10 @@ public:
 	static long OnGetFloatPara(char paraName[30], double *retValue);
 	static long OnSavePara();
 	static bool OnGetBuf(DCSS *ret);
+	// Number of complete realtime FX frames received since the current link.
+	// This is separate from the controller's output serial because some
+	// controller/firmware combinations leave that serial unchanged or zero.
+	static unsigned long long OnGetFrameGeneration();
 
 	static bool OnStartGather(long targetNum, long targetID[35], long recordNum);
 	static bool OnStopGather();
@@ -181,6 +185,7 @@ protected:
 #endif
 	DCSS m_DCSS;
 	std::mutex m_dcss_mutex;
+	std::atomic<unsigned long long> m_frame_generation{0};
 
 	DCSS m_DCSS_Send;
 	FX_UCHAR m_RunState;

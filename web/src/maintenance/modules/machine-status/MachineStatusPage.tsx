@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
-  Alert, Button, Card, Col, Descriptions, Dropdown, Empty, Flex, Input, Modal, Progress, Radio,
+  Alert, Button, Card, Col, DatePicker, Descriptions, Dropdown, Empty, Flex, Input, Modal, Progress, Radio,
   Row, Select, Spin, Statistic, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
-import { DownOutlined, ReloadOutlined } from '@ant-design/icons';
+import { BarChartOutlined, DownOutlined, ReloadOutlined } from '@ant-design/icons';
+import dayjs, { type Dayjs } from 'dayjs';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { PageContainer } from '@common/components/PageContainer';
 import { useMachines, useEquipmentConfig } from '@common/hooks/useData';
@@ -29,6 +30,8 @@ export default function MachineStatusPage() {
   const [reason, setReason] = useState('');
   const [saving, setSaving] = useState(false);
   const [histMachine, setHistMachine] = useState<string | null>(null);
+  const [timelineMachine, setTimelineMachine] = useState<string | null>(null);
+  const [timelineDate, setTimelineDate] = useState<Dayjs>(dayjs());
   const [infoMachine, setInfoMachine] = useState<string | null>(null);
 
   const machineList = machines.data || [];
@@ -42,7 +45,11 @@ export default function MachineStatusPage() {
 
   const deviceFiltered = useMemo(() => {
     if (deviceTypeFilter === 'all') return numbers;
-    return numbers.filter(n => (latestMap[n]?.deviceType || '') === deviceTypeFilter);
+    return numbers.filter(n => {
+      const type = String(latestMap[n]?.machineType || '').toLowerCase();
+      const effective = type === 'dexterous' ? 'dexterous' : type === 'glove_only' ? 'glove' : (latestMap[n]?.deviceType || '');
+      return effective === deviceTypeFilter;
+    });
   }, [numbers, deviceTypeFilter, latestMap]);
 
   const counts = useMemo(() => {
@@ -72,6 +79,12 @@ export default function MachineStatusPage() {
     enabled: !!histMachine,
   });
 
+  const timeline = useQuery({
+    queryKey: ['machine-status-timeline', timelineMachine, timelineDate.format('YYYY-MM-DD')],
+    queryFn: () => api.getMachineStatusTimeline(timelineMachine!, timelineDate.format('YYYY-MM-DD')),
+    enabled: !!timelineMachine,
+  });
+
   const machineInfo = useQuery({
     queryKey: ['machine-info', infoMachine],
     queryFn: () => api.getMachineInfo(infoMachine!),
@@ -89,6 +102,21 @@ export default function MachineStatusPage() {
     mutationFn: (m: string) => api.getMachineInfo(m, { refresh: true }),
     onSuccess: (data) => qc.setQueryData(['machine-info', infoMachine], data),
   });
+  const armSession = useMutation({
+    mutationFn: ({ machineNumber, action }: { machineNumber: string; action: 'connect' | 'disconnect' }) =>
+      api.armControl(machineNumber, action),
+    onSuccess: (data) => {
+      if (infoMachine) qc.setQueryData(['machine-info', infoMachine], (old: any) => ({ ...(old || {}), marvinBroker: data?.state || old?.marvinBroker }));
+      if (data?.success || data?.ok) message.success(data?.action === 'disconnect' ? '已退出机械臂连接，端口已释放' : '已发起机械臂连接');
+      else message.error(data?.error || '机械臂操作失败');
+    },
+    onError: (error: any) => message.error(error?.message || '机械臂操作失败'),
+  });
+  const questSession = useMutation({
+    mutationFn: ({ machineNumber, action }: { machineNumber: string; action: 'connect'|'disconnect' }) => api.questControl(machineNumber, action),
+    onSuccess: (_d, vars) => { message.success(vars.action === 'connect' ? '已发起 Quest 连接' : '已退出 Quest'); if (infoMachine) qc.invalidateQueries({ queryKey: ['machine-info', infoMachine] }); },
+    onError: (e: any) => message.error(e?.message || 'Quest 操作失败'),
+  });
   const histItems = useMemo(() => {
     let list = history.data || [];
     const q = histSearch.trim().toLowerCase();
@@ -105,7 +133,8 @@ export default function MachineStatusPage() {
     const opts = [{ value: 'all', label: '全部设备类型' }];
     const seen = new Set<string>();
     for (const n of numbers) {
-      const dt = latestMap[n]?.deviceType;
+      const rawType = String(latestMap[n]?.machineType || '').toLowerCase();
+      const dt = rawType === 'dexterous' ? 'dexterous' : rawType === 'glove_only' ? 'glove' : latestMap[n]?.deviceType;
       if (!dt || seen.has(dt)) continue;
       seen.add(dt);
       opts.push({ value: dt, label: eqLabel(dt) });
@@ -160,6 +189,14 @@ export default function MachineStatusPage() {
   };
 
   const isCollectorMachine = (n: string) => /^(?:we|szx3)-\d+$/.test(n);
+
+  const formatDuration = (seconds: number) => {
+    const s = Math.max(0, Math.round(Number(seconds) || 0));
+    if (s < 60) return `${s}秒`;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h ? `${h}小时${m}分` : `${m}分`;
+  };
 
   const devTag = (d: any) => {
     if (!d) return <Tag style={{ margin: 0, opacity: 0.5 }}>无</Tag>;
@@ -234,10 +271,11 @@ export default function MachineStatusPage() {
     { title: '更新人', dataIndex: 'productionUpdatedByName', render: (v: string, r: any) => v || (r.productionSource === 'ticket' ? '工单联动' : '-') },
     { title: '更新时间', dataIndex: 'productionUpdatedAt', render: (v: string) => v ? formatTime(v) : '-' },
     {
-      title: '操作', dataIndex: 'machineNumber', key: 'op', width: 220,
+      title: '操作', dataIndex: 'machineNumber', key: 'op', width: 250, fixed: 'right',
       render: (num: string) => (
         <Flex gap={4} wrap="wrap">
           <Button size="small" type="link" onClick={e => { e.stopPropagation(); setHistMachine(num); }}>历史</Button>
+          <Button size="small" type="link" icon={<BarChartOutlined />} onClick={e => { e.stopPropagation(); setTimelineMachine(num); }}>日报</Button>
           {isCollectorMachine(num) && (
             <Button size="small" type="link" onClick={e => { e.stopPropagation(); setInfoMachine(num); }}>采集器</Button>
           )}
@@ -381,6 +419,134 @@ export default function MachineStatusPage() {
         )}
       </Modal>
 
+      <Modal
+        title={timelineMachine ? `${timelineMachine} · 每日状态日报` : ''}
+        open={!!timelineMachine}
+        onCancel={() => setTimelineMachine(null)}
+        footer={null}
+        width={900}
+      >
+        <Flex align="center" justify="space-between" wrap="wrap" gap={8} style={{ marginBottom: 14 }}>
+          <Typography.Text type="secondary">记录的是运行状态和生产状态的连续时间区间</Typography.Text>
+          <DatePicker value={timelineDate} allowClear={false} onChange={v => v && setTimelineDate(v)} />
+        </Flex>
+        {timeline.isLoading ? (
+          <div style={{ textAlign: 'center', padding: 40 }}><Spin /></div>
+        ) : timeline.isError ? (
+          <Alert type="error" showIcon message="日报读取失败" description={(timeline.error as Error)?.message || '请稍后重试'} />
+        ) : (() => {
+          const data = timeline.data || ({} as any);
+          const summary = data.summary || {};
+          const runtime = data.intervals || [];
+          const production = data.productionIntervals || [];
+          // API 按 Asia/Shanghai 切日；这里必须用 +08:00 解析，不能使用 Z，
+          // 否则日报时间轴会整体偏移 8 小时（例如 105 的 01:59 会被画到 08:00）。
+          const reportDate = data.date || timelineDate.format('YYYY-MM-DD');
+          const dayStart = Date.parse(`${reportDate}T00:00:00+08:00`);
+          const dayEnd = Date.parse(`${reportDate}T23:59:59.999+08:00`);
+          const meta = data.statusMeta || {};
+          const incidentReason = (r: any) => {
+            const d = r?.details || {};
+            const parts: string[] = [];
+            if (d.reason) parts.push(String(d.reason));
+            if (Array.isArray(d.degraded) && d.degraded.length) {
+              parts.push(`采集组件降级：${d.degraded.join('、')}`);
+            }
+            if (Array.isArray(d.alerts)) {
+              for (const alert of d.alerts) {
+                const alertCode = String(alert?.code || '').trim().toLowerCase();
+                if (['glove_no_sn', 'sn_unusable', 'sn_bound_elsewhere', 'unregistered_sn', 'hand_mismatch'].includes(alertCode)
+                  || /(^|_)sn(_|$)/.test(alertCode)) continue;
+                const message = alert?.message || alert?.msg;
+                if (message && !parts.includes(String(message))) parts.push(String(message));
+              }
+            }
+            if (Array.isArray(d.errors)) {
+              for (const error of d.errors) {
+                const message = error?.message || error?.err_msg || error?.error;
+                if (message && !parts.includes(String(message))) parts.push(String(message));
+              }
+            }
+            if (d.source === 'ticket' && d.ticketId && !parts.some(p => p.includes('工单'))) {
+              parts.push(`关联工单：${d.ticketId}`);
+            }
+            return parts.join('；');
+          };
+          const segment = (r: any, i: number) => {
+            const start = Math.max(dayStart, Date.parse(r.startedAt) || dayStart);
+            const end = Math.min(dayEnd, Date.parse(r.endedAt || new Date().toISOString()) || Date.now());
+            const left = Math.max(0, Math.min(100, ((start - dayStart) / (dayEnd - dayStart)) * 100));
+            const width = Math.max(0.35, Math.min(100 - left, ((Math.max(start, end) - start) / (dayEnd - dayStart)) * 100));
+            const m = meta[r.status] || { label: r.label || r.status, color: '#bfbfbf' };
+            const reason = incidentReason(r);
+            return <div key={`${r.id || r.status}-${i}`} title={`${m.label} ${dayjs(start).format('HH:mm:ss')} - ${r.endedAt ? dayjs(end).format('HH:mm:ss') : '当前'}（${formatDuration(r.durationSec)}）${reason ? ` · ${reason}` : ''}`} style={{ position: 'absolute', left: `${left}%`, width: `${width}%`, top: 0, bottom: 0, background: m.color, opacity: 0.9 }} />;
+          };
+          const timelineBar = (items: any[]) => (
+            <div style={{ position: 'relative', height: 24, background: '#f0f0f0', borderRadius: 4, overflow: 'hidden', flex: 1, minWidth: 300 }}>
+              {items.map(segment)}
+              <Flex justify="space-between" style={{ position: 'absolute', inset: '100% auto auto 0', width: '100%', transform: 'translateY(3px)', fontSize: 10, color: '#8c8c8c' }}>
+                <span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span>
+              </Flex>
+            </div>
+          );
+          const statusOrder = ['recording', 'online_idle', 'error', 'offline', 'unknown'];
+          return (
+            <>
+              <Row gutter={[8, 8]} style={{ marginBottom: 22 }}>
+                {statusOrder.map(key => (
+                  <Col xs={12} sm={8} md={4} key={key}>
+                    <Card size="small" style={{ borderTop: `3px solid ${(meta[key] || {}).color || '#bfbfbf'}` }}>
+                      <Statistic title={(meta[key] || {}).label || key} value={formatDuration(summary[key]?.seconds || 0)} valueStyle={{ fontSize: 18 }} />
+                    </Card>
+                  </Col>
+                ))}
+              </Row>
+              <Typography.Text strong>运行状态时间轴</Typography.Text>
+              <Flex align="center" gap={8} style={{ marginTop: 8, marginBottom: 26 }}>
+                <Typography.Text style={{ width: 56 }}>运行</Typography.Text>
+                {timelineBar(runtime)}
+              </Flex>
+              <Typography.Text strong>运行状态明细</Typography.Text>
+              <Table
+                size="small" rowKey={(r: any, i) => `${r.id || r.status}-${i}`} style={{ marginTop: 8, marginBottom: 18 }}
+                dataSource={runtime} pagination={{ pageSize: 8, showSizeChanger: false }}
+                locale={{ emptyText: '当天暂无心跳状态记录' }}
+                columns={[
+                  { title: '状态', dataIndex: 'status', width: 110, render: (v: string, r: any) => <Tag color={(meta[v] || {}).color}>{(meta[v] || {}).label || r.label || v}</Tag> },
+                  { title: '开始', dataIndex: 'startedAt', render: (v: string) => dayjs(v).format('YYYY-MM-DD HH:mm:ss') },
+                  { title: '结束', dataIndex: 'endedAt', render: (v: string) => v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '当前' },
+                  { title: '持续时间', dataIndex: 'durationSec', render: (v: number) => formatDuration(v) },
+                  { title: '异常原因', key: 'reason', width: 320, render: (_: any, r: any) => {
+                    const reason = incidentReason(r);
+                    return r.status === 'error'
+                      ? (reason ? <Typography.Text type="danger" ellipsis={{ tooltip: reason }}>{reason}</Typography.Text> : <Typography.Text type="secondary">暂无采集原因</Typography.Text>)
+                      : <Typography.Text type="secondary">-</Typography.Text>;
+                  } },
+                ]}
+              />
+              <Typography.Text strong>生产状态明细</Typography.Text>
+              <Table
+                size="small" rowKey={(r: any, i) => `${r.id || r.status}-${i}`} style={{ marginTop: 8 }}
+                dataSource={production} pagination={{ pageSize: 8, showSizeChanger: false }}
+                locale={{ emptyText: '当天暂无生产状态变更记录' }}
+                columns={[
+                  { title: '状态', dataIndex: 'status', width: 110, render: (v: string, r: any) => <Tag color={(meta[v] || {}).color}>{(meta[v] || {}).label || r.label || v}</Tag> },
+                  { title: '开始', dataIndex: 'startedAt', render: (v: string) => dayjs(v).format('YYYY-MM-DD HH:mm:ss') },
+                  { title: '结束', dataIndex: 'endedAt', render: (v: string) => v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '当前' },
+                  { title: '持续时间', dataIndex: 'durationSec', render: (v: number) => formatDuration(v) },
+                  { title: '原因', key: 'reason', width: 320, render: (_: any, r: any) => {
+                    const reason = incidentReason(r);
+                    return reason
+                      ? <Typography.Text ellipsis={{ tooltip: reason }}>{reason}</Typography.Text>
+                      : <Typography.Text type="secondary">-</Typography.Text>;
+                  } },
+                ]}
+              />
+            </>
+          );
+        })()}
+      </Modal>
+
       
       <Modal
         title={infoMachine ? `${infoMachine} · 机器状态信息` : ''}
@@ -388,6 +554,12 @@ export default function MachineStatusPage() {
         onCancel={() => setInfoMachine(null)}
         footer={
           <Flex gap={8} justify="flex-end">
+            <Button
+              icon={<BarChartOutlined />}
+              onClick={() => { if (infoMachine) setTimelineMachine(infoMachine); }}
+            >
+              日报
+            </Button>
             <Button
               icon={<ReloadOutlined spin={liveInfo.isPending} />}
               loading={liveInfo.isPending}
@@ -408,9 +580,20 @@ export default function MachineStatusPage() {
           <Empty description={machineInfo.data?.error || '暂无数据'} />
         ) : (() => {
           const info = machineInfo.data;
+          const collectorStarted = info.collectorStarted !== false
+            && info.containerRoleStatus?.collector?.running !== false
+            && info.edgeContainerRoleStatus?.collector?.running !== false
+            && !info.partial?.hermesOffline;
           const sys = info.system || {};
           const dev = info.devices || {};
           const wuji = info.wuji || {};
+          const isGloveOnlyMachine = info.machineType === 'glove_only'
+            || info.machineProfile?.machineType === 'glove_only';
+          const hasDexterousMachine = !isGloveOnlyMachine;
+          const marvin = info.marvinBroker || info.devicesNet?.roboticArm || null;
+          const marvinConnected = !!marvin?.connected;
+          const marvinBusy = armSession.isPending;
+          const machineTypeLabel = isGloveOnlyMachine ? '纯手套机器' : info.machineType === 'dexterous' ? '灵巧手机器' : '机器类型未知';
           const task = info.task;
           const csMeta: Record<string, { l: string; c?: string }> = {
             RECORD: { l: '录制中', c: 'red' }, ACTIVE: { l: '就绪', c: 'green' },
@@ -455,17 +638,18 @@ export default function MachineStatusPage() {
           );
           return (
             <div>
-              {(machineInfo.data as any)?.partial?.importer && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message="Importer(5025) 暂不可达" />}
-              {(machineInfo.data as any)?.partial?.hermesOffline && (
+              {collectorStarted && (machineInfo.data as any)?.partial?.importer && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message="Importer(5025) 暂不可达" />}
+              {!collectorStarted && (
                 <div style={{ background: '#fafafa', border: '1px solid #f0f0f0', borderRadius: 8, padding: '6px 12px', fontSize: 13, color: '#8c8c8c', marginBottom: 8 }}>
-                  采集程序未运行
+                  采集程序未运行，暂不进行设备连接故障判断
                 </div>
               )}
-              {(machineInfo.data as any)?.partial?.hermesFailed && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message="采集程序(5006) 暂不可达" />}
+              {collectorStarted && (machineInfo.data as any)?.partial?.hermesFailed && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message="采集程序(5006) 暂不可达" />}
 
               
               <Descriptions size="small" column={2} bordered style={{ marginBottom: 12 }}
                 items={[
+                  { key: 'machine-type', label: '机器类型', children: <Tag color={isGloveOnlyMachine ? 'default' : info.machineType === 'dexterous' ? 'blue' : 'orange'}>{machineTypeLabel}</Tag> },
                   { key: 'act', label: '系统程序', children: (
                     <Flex gap={4} wrap="wrap" align="center">
                       <Tag color={sys.activity === 'running' ? 'green' : 'default'} style={{ margin: 0 }}>{sys.activity === 'running' ? '运行中' : sys.activity === 'idle' ? '空闲' : (sys.activity || '未知')}</Tag>
@@ -479,13 +663,24 @@ export default function MachineStatusPage() {
                       )}
                     </Flex>
                   ) },
-                  { key: 'err', label: '错误数', children: (sys.errorCount ?? 0) > 0 ? <Tag color="red" style={{ margin: 0 }}>{sys.errorCount}</Tag> : <Tag color="green" style={{ margin: 0 }}>0</Tag> },
+                  { key: 'err', label: '错误数', children: !collectorStarted ? <Tag style={{ margin: 0 }}>未运行</Tag> : (sys.errorCount ?? 0) > 0 ? <Tag color="red" style={{ margin: 0 }}>{sys.errorCount}</Tag> : <Tag color="green" style={{ margin: 0 }}>0</Tag> },
                   { key: 'ver', label: '程序版本', children: `Importer ${info.importerVersion || '-'} / 采集 ${info.collectorVersion || '-'}` },
                   { key: 'id', label: '采集器', children: `${info.collectorName || '-'}（主机 ${info.computerId || '-'}）` },
                 ]}
               />
 
               
+              <Card size="small" title="主机探针（实时）" style={{ marginBottom: 12 }}>
+                {(() => { const h = info.host || {}; const dur = (v: any) => { if (v == null) return "-"; const s = Math.max(0, Math.floor(Number(v))); return `${Math.floor(s / 86400)}天 ${Math.floor((s % 86400) / 3600)}时 ${Math.floor((s % 3600) / 60)}分`; }; return <Flex wrap="wrap" gap={8}>
+                  {cell("系统运行时间", dur(h.uptime), h.bootTime ? `启动于 ${formatTime(h.bootTime)}` : undefined)}
+                  {cell("Agent 运行时间", dur(h.agentUptime))}
+                  {cell("CPU 负载", Array.isArray(h.loadAverage) ? h.loadAverage.map((v: number) => Number(v).toFixed(2)).join(" / ") : "-")}
+                  {cell("内存占用", h.memoryUsedPercent != null ? `${h.memoryUsedPercent}%` : "-")}
+                  {cell("CPU 核数", h.cpus ?? "-")}
+                  {cell("探针采样", h.sampledAt ? formatTime(h.sampledAt) : "-")}
+                </Flex>; })()}
+              </Card>
+
               <Card size="small" title="当前任务" style={{ marginBottom: 12 }}>
                 {task ? (
                   <>
@@ -508,9 +703,21 @@ export default function MachineStatusPage() {
                 ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前没有任务" />}
               </Card>
 
+              <Card size="small" title="Importer 录制质量" style={{ marginBottom: 12 }}>
+                {(() => {
+                  const imp: any = info.importer || {};
+                  const q: any = imp.quality || imp.qualityStats || imp.recordingQuality || {};
+                  const total = q.total ?? q.recorded ?? q.recordCount ?? imp.recordCount;
+                  const passed = q.passed ?? q.pass ?? q.qualityPassed ?? imp.qualityPassed;
+                  const failed = q.failed ?? q.fail ?? q.qualityFailed ?? imp.qualityFailed;
+                  if (total == null && passed == null && failed == null) return <span style={{opacity:.55}}>Importer 未提供录制质量统计</span>;
+                  return <Flex wrap="wrap" gap={8}>{cell('录制总数', total ?? '-')} {cell('质量通过', passed ?? '-')} {cell('质量不通过', failed ?? '-')}</Flex>;
+                })()}
+              </Card>
+
               
               <Card size="small" title="设备状态" style={{ marginBottom: 12 }}>
-                {!dev.dexterousHands?.left && !dev.dexterousHands?.right && !dev.quest && !dev.gloves?.left && !dev.gloves?.right && !dev.cameras?.length && !dev.other?.length && !info.questInfo && !info.devicesNet && !info.camerasFps?.length && !info.cameras?.length && !info.wuji ? (
+                {!collectorStarted || (!dev.dexterousHands?.left && !dev.dexterousHands?.right && !dev.quest && !dev.gloves?.left && !dev.gloves?.right && !dev.cameras?.length && !dev.other?.length && !info.questInfo && !info.devicesNet && !info.camerasFps?.length && !info.cameras?.length && !info.wuji) ? (
                   <div style={{ color: '#8c8c8c', fontSize: 13, padding: '4px 0' }}>
                     采集程序未运行
                   </div>
@@ -545,15 +752,15 @@ export default function MachineStatusPage() {
                         const rNet = info.devicesNet?.dexterousHands?.right || wuji.dexterousHands?.right;
                         return (
                           <>
-                            {cell('灵巧手（左）', tagFor(dev.dexterousHands?.left, lNet), handDetail('left', lNet))}
-                            {cell('灵巧手（右）', tagFor(dev.dexterousHands?.right, rNet), handDetail('right', rNet))}
+                            {hasDexterousMachine && cell('灵巧手（左）', tagFor(dev.dexterousHands?.left, lNet), handDetail('left', lNet))}
+                            {hasDexterousMachine && cell('灵巧手（右）', tagFor(dev.dexterousHands?.right, rNet), handDetail('right', rNet))}
                           </>
                         );
                       })()}
                       {(() => {
                         const qi = info.questInfo;
                         const netOff = qi && qi.netConnected === false;
-                        return cell('Quest', tagFor(dev.quest, qi ? { connected: qi.netConnected } : null),
+                        return cell('Quest', <Flex gap={6} align="center" wrap="wrap"><span>{tagFor(dev.quest, qi ? { connected: qi.netConnected } : null)}</span><Button size="small" type="primary" loading={questSession.isPending && questSession.variables?.action==='connect'} disabled={!!qi?.netConnected} onClick={() => infoMachine && questSession.mutate({machineNumber: infoMachine, action:'connect'})}>连接 Quest</Button><Button size="small" danger loading={questSession.isPending && questSession.variables?.action==='disconnect'} disabled={!qi?.netConnected} onClick={() => infoMachine && questSession.mutate({machineNumber: infoMachine, action:'disconnect'})}>退出 Quest</Button></Flex>,
                           <span>
                             {qi?.serialNumber && <span style={{ fontFamily: 'monospace' }}>SN: {qi.serialNumber}　</span>}
                             {qi && !qi.serialNumber && qi.adbStatus === 'unauthorized' && <span style={{ color: '#d46b08' }}>USB 调试未授权　</span>}
@@ -584,9 +791,25 @@ export default function MachineStatusPage() {
                           </>
                         );
                       })()}
-                      {(dev.marvin || dev.other?.some((o: any) => o.key === 'robot/marvin') || info.devicesNet?.roboticArm) && cell('机械臂 Marvin',
-                        tagFor(dev.marvin, info.devicesNet?.roboticArm ? { connected: info.devicesNet.roboticArm.connected } : null),
-                        info.devicesNet?.roboticArm && info.devicesNet.roboticArm.connected === false ? <span style={{ color: '#cf1322' }}>网络不可达</span> : null)}
+                      {hasDexterousMachine && (dev.marvin || dev.other?.some((o: any) => o.key === 'robot/marvin') || info.devicesNet?.roboticArm || info.marvinBroker) && cell('机械臂 Marvin',
+                        <Flex gap={6} align="center" wrap="wrap">
+                          {marvinConnected ? <Tag color="green" style={{ margin: 0 }}>已连接</Tag> : <Tag color="default" style={{ margin: 0 }}>未连接</Tag>}
+                          <Button
+                            size="small"
+                            type={marvinConnected ? 'default' : 'primary'}
+                            loading={marvinBusy}
+                            disabled={marvinConnected}
+                            onClick={() => infoMachine && armSession.mutate({ machineNumber: infoMachine, action: 'connect' })}
+                          >连接机械臂</Button>
+                          <Button
+                            size="small"
+                            danger
+                            loading={marvinBusy && marvinConnected}
+                            disabled={!marvinConnected && !armSession.isPending}
+                            onClick={() => infoMachine && armSession.mutate({ machineNumber: infoMachine, action: 'disconnect' })}
+                          >退出</Button>
+                        </Flex>,
+                        marvin?.error ? <span style={{ color: marvinConnected ? '#8c8c8c' : '#cf1322' }}>{marvin.error}</span> : '连接后可执行机械臂控制操作')}
                       {(() => {
                         const cameraRows = (dev.cameras && dev.cameras.length)
                           ? dev.cameras
@@ -609,13 +832,17 @@ export default function MachineStatusPage() {
                           ? `${fps.toFixed(1)} fps`
                           : 'FPS 暂无';
                         const resolution = res && res.width ? `${res.width}×${res.height}` : null;
-                        const cameraStatus = Number.isFinite(fps) && fps > 0
-                          ? (fpsCamera.isDropping ? <Tag color="orange" style={{ margin: 0 }}>掉帧</Tag> : <Tag color="green" style={{ margin: 0 }}>正常</Tag>)
-                          : <Tag style={{ margin: 0, opacity: 0.6 }}>无数据</Tag>;
+                        const cameraStatus = fpsCamera.status === 'error' || fpsCamera.connected === false
+                          ? <Tag color="red" style={{ margin: 0 }}>异常</Tag>
+                          : fpsCamera.status === 'dropping' || fpsCamera.isDropping
+                            ? <Tag color="orange" style={{ margin: 0 }}>掉帧</Tag>
+                            : Number.isFinite(fps) && fps > 0
+                              ? <Tag color="green" style={{ margin: 0 }}>正常</Tag>
+                              : <Tag style={{ margin: 0, opacity: 0.6 }}>无数据</Tag>;
                         return cell(
                           camName(cameraKey),
                           <Flex align="center" gap={6} wrap="wrap">
-                            {dev.cameras?.length ? devTag(c) : cameraStatus}
+                            {cameraStatus}
                             <span style={{ fontFamily: 'monospace', fontSize: 12, color: Number.isFinite(fps) && fps > 0 ? '#389e0d' : '#8c8c8c' }}>
                               {fpsDetail}
                             </span>
@@ -644,17 +871,17 @@ export default function MachineStatusPage() {
               </Card>
 
               
-              <Card size="small" title="采集器容器">
+              <Card size="small" title="容器状态">
                 <Flex gap={4} wrap="wrap" style={{ marginBottom: (info.degraded?.length || info.errors?.length) ? 8 : 0 }}>
                   {(info.containers || []).map((c: any) => (
-                    <Tag key={c.name} color={c.status === 'running' ? 'green' : 'red'} style={{ margin: 0 }}>
-                      {c.name}: {c.status === 'running' ? '运行中' : c.status}
+                    <Tag key={c.name} color={(c.running === true || c.status === 'running') ? 'green' : 'red'} style={{ margin: 0 }}>
+                      {c.name}: {(c.running === true || c.status === 'running') ? '运行中' : (c.status || c.state || '已停止')}
                     </Tag>
                   ))}
                   {!info.containers?.length && <span style={{ opacity: 0.45 }}>-</span>}
                 </Flex>
-                {!!info.degraded?.length && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message={`降级部件：${info.degraded.join('、')}`} />}
-                {!!info.errors?.length && <Alert type="error" showIcon message={`采集器错误：${info.errors.length} 条`} description={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{JSON.stringify(info.errors, null, 2)}</pre>} />}
+                {collectorStarted && !!info.degraded?.length && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message={`降级部件：${info.degraded.join('、')}`} />}
+                {collectorStarted && !!info.errors?.length && <Alert type="error" showIcon message={`采集器错误：${info.errors.length} 条`} description={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{JSON.stringify(info.errors, null, 2)}</pre>} />}
               </Card>
               <div style={{ color: '#8c8c8c', fontSize: 12, textAlign: 'right' }}>
                 {info.source === 'agent'

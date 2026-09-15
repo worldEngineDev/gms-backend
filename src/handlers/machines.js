@@ -1,6 +1,7 @@
 'use strict';
 
 const os = require('os');
+const { getEdgeLive } = require('../edge-live');
 
 module.exports = function createMachinesHandlers(deps) {
   const {
@@ -18,9 +19,67 @@ module.exports = function createMachinesHandlers(deps) {
     _snToInvType,
     broadcastChange,
     broadcastSSE,
-    loadEdgePresence,
-    getEdgeLive,
   } = deps;
+
+  async function loadAgentPresence() {
+    const [rows] = await pool.execute(
+      "SELECT machineNumber, status, lastSeen, data, agentVersion FROM edge_hosts WHERE agentVersion IS NOT NULL AND agentVersion <> ''",
+    );
+    const result = {};
+    for (const row of rows) {
+      let data = {};
+      try { data = JSON.parse(row.data || '{}'); } catch { }
+      result[row.machineNumber] = {
+        ...data,
+        edgeContainers: data.edgeContainers || data.containers || [],
+        hostOnline: row.status === 'online',
+        hostLastSeen: row.lastSeen || data.hostLastSeen || null,
+        statusSource: 'agent',
+      };
+    }
+    return result;
+  }
+
+  function compactPresenceForMachineList(presence) {
+    const importer = presence.importer || {};
+    const hermes = presence.hermes || {};
+    return {
+      hostOnline: presence.hostOnline,
+      hostLastSeen: presence.hostLastSeen,
+      statusSource: presence.statusSource,
+      machineType: presence.machineType || null,
+      edgeAlerts: Array.isArray(presence.alerts) ? presence.alerts : [],
+      importer: {
+        reachable: importer.reachable,
+        machineId: importer.machineId || null,
+        computerId: importer.computerId || null,
+        workflow: importer.workflow || null,
+        collectorType: importer.collectorType || null,
+        importerVersion: importer.importerVersion || null,
+        activity: importer.activity || null,
+        collectorAlive: importer.collectorAlive,
+        loggedIn: importer.loggedIn,
+        idleTimeSecs: importer.idleTimeSecs,
+        task: importer.task || null,
+        workers: Array.isArray(importer.workers) ? importer.workers : [],
+        queue: importer.queue || null,
+      },
+      hermes: {
+        reachable: hermes.reachable,
+        health: hermes.health || null,
+        state: hermes.state || null,
+      },
+    };
+  }
+
+  async function handleListAgentHosts(req, res) {
+    try {
+      const presence = await loadAgentPresence();
+      sendJSON(res, { success: true, hosts: Object.entries(presence).map(([machineNumber, data]) => ({ machineNumber, ...data })) });
+    } catch (e) {
+      sendJSON(res, { error: e.message || '读取 Agent 快照失败' }, 500);
+    }
+  }
 
   function handleGetMachineCode(req, res) {
     const hostname = os.hostname();
@@ -57,7 +116,7 @@ module.exports = function createMachinesHandlers(deps) {
         else if (r.handType === 'right') occupancy[r.machineNumber].right = r.snCode;
       }
 
-      const result = machines.map(m => {
+      let result = machines.map(m => {
         const o = occupancy[m.machineNumber];
         let effectiveStatus = 'offline';
         if (o && o.left && o.right) effectiveStatus = 'online';
@@ -71,18 +130,30 @@ module.exports = function createMachinesHandlers(deps) {
         };
       });
 
-      if (typeof loadEdgePresence === 'function') {
+      {
         try {
-          const presence = await loadEdgePresence();
+          const presence = await loadAgentPresence();
           if (Object.keys(presence).length) {
             for (const m of result) {
-              if (presence[m.machineNumber]) Object.assign(m, presence[m.machineNumber]);
+              if (presence[m.machineNumber]) {
+                Object.assign(m, presence[m.machineNumber]);
+                if (m.hostOnline === true && !['waiting_repair', 'repairing'].includes(m.status)) {
+                  m.status = 'online';
+                  m.onlineReason = 'Agent 实时采集在线';
+                }
+              }
             }
           }
         } catch (e) {
-          console.error('[Mobile Machines] edge presence 合并失败:', e.message);
+          console.error('[Mobile Machines] Agent 快照合并失败:', e.message);
         }
       }
+
+      result = result.map(_applyMachineTypeOverride).map(m => {
+        if (m.machineType === 'dexterous') return { ...m, deviceType: 'dexterous' };
+        if (m.machineType === 'glove_only') return { ...m, deviceType: 'glove' };
+        return m;
+      });
 
       try {
         const prodMap = await loadProductionStatuses();
@@ -195,17 +266,29 @@ module.exports = function createMachinesHandlers(deps) {
     });
 
     let result = records;
-    if (typeof loadEdgePresence === 'function') {
-      try {
-        const presence = await loadEdgePresence();
+      {
+    try {
+      const presence = await loadAgentPresence();
         if (Object.keys(presence).length) {
           result = records.map(machine => presence[machine.machineNumber]
-            ? { ...machine, ...presence[machine.machineNumber] }
+            ? {
+              ...machine,
+              ...compactPresenceForMachineList(presence[machine.machineNumber]),
+              ...((presence[machine.machineNumber].hostOnline === true
+                && !['waiting_repair', 'repairing'].includes(machine.status))
+                ? { status: 'online', onlineReason: 'Agent 实时采集在线' } : {}),
+            }
             : machine);
-        }
-      } catch (e) {
-        console.error('[Machines] edge presence 合并失败:', e.message);
       }
+    } catch (e) {
+      console.error('[Machines] Agent 快照合并失败:', e.message);
+    }
+
+    result = result.map(_applyMachineTypeOverride).map(machine => machine.machineType === 'dexterous'
+      ? { ...machine, deviceType: 'dexterous' }
+      : machine.machineType === 'glove_only'
+        ? { ...machine, deviceType: 'glove' }
+        : machine);
     }
 
     try {
@@ -588,6 +671,175 @@ module.exports = function createMachinesHandlers(deps) {
     testing: { label: '在测试' },
   };
 
+  const STATUS_LABELS = {
+    offline: '离线',
+    recording: '录制中',
+    online_idle: '在线空闲',
+    error: '异常',
+    unknown: '未知',
+    ready: '可生产',
+    in_production: '在生产',
+    waiting_repair: '待维修',
+    testing: '在测试',
+  };
+
+  // 将状态按连续时间区间持久化。相同状态只更新开放区间，状态变化才关闭并新建区间。
+  async function recordStatusInterval(machineNumber, statusType, status, details = null, at = new Date().toISOString()) {
+    machineNumber = String(machineNumber || '').trim().toLowerCase();
+    statusType = String(statusType || '').trim().toLowerCase();
+    status = String(status || 'unknown').trim();
+    if (!machineNumber || !statusType || !status) return { ok: false, error: 'invalid_args' };
+    const nowMs = Date.parse(at) || Date.now();
+    let conn;
+    const lockName = `gms:machine-status:${machineNumber}:${statusType}`;
+    let lockAcquired = false;
+    try {
+      conn = await pool.getConnection();
+      const [lockRows] = await conn.execute('SELECT GET_LOCK(?, 3) AS locked', [lockName]);
+      lockAcquired = Number(lockRows?.[0]?.locked) === 1;
+      if (!lockAcquired) return { ok: false, error: 'status_interval_busy' };
+      await conn.beginTransaction();
+      const [rows] = await conn.execute(
+        'SELECT id,status,startedAt,lastSeenAt FROM machine_status_intervals WHERE machineNumber = ? AND statusType = ? AND openKey = \'Y\' ORDER BY startedAt DESC LIMIT 1 FOR UPDATE',
+        [machineNumber, statusType]
+      );
+      const open = rows[0];
+      const detailText = details == null ? null : JSON.stringify(details);
+      if (open && open.status === status) {
+        const startedMs = Date.parse(open.startedAt) || nowMs;
+        const durationSec = Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+        await conn.execute(
+          'UPDATE machine_status_intervals SET lastSeenAt = ?, durationSec = ?, details = COALESCE(?, details), updatedAt = ? WHERE id = ?',
+          [at, durationSec, detailText, at, open.id]
+        );
+      } else {
+        if (open) {
+          const startedMs = Date.parse(open.startedAt) || nowMs;
+          const durationSec = Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+          await conn.execute(
+            'UPDATE machine_status_intervals SET endedAt = ?, lastSeenAt = ?, durationSec = ?, openKey = NULL, updatedAt = ? WHERE id = ?',
+            [at, at, durationSec, at, open.id]
+          );
+        }
+        const id = `msi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+        await conn.execute(
+          'INSERT INTO machine_status_intervals (id,machineNumber,statusType,status,startedAt,endedAt,lastSeenAt,durationSec,details,openKey,createdAt,updatedAt) VALUES (?,?,?,?,?,NULL,?,?,?,\'Y\',?,?)',
+          [id, machineNumber, statusType, status, at, at, 0, detailText, at, at]
+        );
+      }
+      await conn.commit();
+      return { ok: true };
+    } catch (e) {
+      try { if (conn) await conn.rollback(); } catch {}
+      // 多进程同时首次写入时，唯一键竞争不应影响心跳主流程。
+      console.error('[Machine Status Interval] write error:', e.message);
+      return { ok: false, error: e.message };
+    } finally {
+      if (conn && lockAcquired) {
+        try { await conn.execute('SELECT RELEASE_LOCK(?)', [lockName]); } catch {}
+      }
+      try { if (conn) conn.release(); } catch {}
+    }
+  }
+
+  const STATUS_TIMELINE_META = {
+    recording: { label: '录制中', color: '#ff4d4f' },
+    online_idle: { label: '在线空闲', color: '#52c41a' },
+    error: { label: '异常', color: '#fa8c16' },
+    offline: { label: '离线', color: '#8c8c8c' },
+    unknown: { label: '未知', color: '#bfbfbf' },
+    ready: { label: '可生产', color: '#52c41a' },
+    in_production: { label: '在生产', color: '#1677ff' },
+    waiting_repair: { label: '待维修', color: '#ff4d4f' },
+    testing: { label: '在测试', color: '#722ed1' },
+  };
+
+  async function handleGetStatusTimeline(req, res, user, machineNumber) {
+    try {
+      machineNumber = String(machineNumber || '').trim().toLowerCase();
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      const url = new URL(req.url, 'http://x');
+      const shanghaiDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date());
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('date') || '')
+        ? url.searchParams.get('date') : shanghaiDate;
+      // 日报按中国标准时间（Asia/Shanghai）切日，再转换为 ISO 时间参与索引查询。
+      const dayStart = new Date(`${date}T00:00:00+08:00`).toISOString();
+      const dayEnd = new Date(`${date}T23:59:59.999+08:00`).toISOString();
+      const [rows] = await pool.execute(
+        `SELECT id,machineNumber,statusType,status,startedAt,endedAt,lastSeenAt,durationSec,details
+           FROM machine_status_intervals
+          WHERE machineNumber = ? AND startedAt <= ? AND (endedAt IS NULL OR endedAt >= ?)
+          ORDER BY statusType, startedAt`,
+        [machineNumber, dayEnd, dayStart]
+      );
+      const now = new Date().toISOString();
+      const clip = (r) => {
+        const start = new Date(Math.max(Date.parse(r.startedAt) || 0, Date.parse(dayStart))).toISOString();
+        const endMs = Math.min(Date.parse(r.endedAt || now) || Date.now(), Date.parse(dayEnd));
+        const end = new Date(Math.max(endMs, Date.parse(start))).toISOString();
+        let details = null; try { details = r.details ? JSON.parse(r.details) : null; } catch {}
+        return { ...r, label: STATUS_LABELS[r.status] || r.status, startedAt: start, endedAt: r.endedAt ? end : null,
+          durationSec: Math.max(0, Math.floor((endMs - Date.parse(start)) / 1000)), details };
+      };
+      const intervals = rows.map(clip);
+      const summary = {};
+      for (const r of intervals) {
+        if (r.statusType !== 'runtime') continue;
+        summary[r.status] = (summary[r.status] || 0) + Number(r.durationSec || 0);
+      }
+      const productionIntervals = intervals.filter(r => r.statusType === 'production');
+      const productionSummary = {};
+      for (const r of productionIntervals) {
+        productionSummary[r.status] = (productionSummary[r.status] || 0) + Number(r.durationSec || 0);
+      }
+      // 老数据尚未有区间时，从生产状态审计流水重建只读区间，避免上线前历史日报为空。
+      if (productionIntervals.length === 0) {
+        const [historyRows] = await pool.execute(
+          'SELECT data FROM machine_production_history WHERE machineNumber = ? ORDER BY createdAt ASC, id ASC LIMIT 2000',
+          [machineNumber]
+        );
+        const events = historyRows.map(r => { try { return JSON.parse(r.data); } catch { return null; } })
+          .filter(r => r && r.newStatus && r.createdAt);
+        for (let i = 0; i < events.length; i++) {
+          const event = events[i];
+          const nextAt = events[i + 1]?.createdAt || now;
+          const startMs = Date.parse(event.createdAt);
+          const endMs = Date.parse(nextAt);
+          if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < Date.parse(dayStart) || startMs > Date.parse(dayEnd)) continue;
+          const clippedStart = Math.max(startMs, Date.parse(dayStart));
+          const clippedEnd = Math.min(endMs, Date.parse(dayEnd));
+          if (clippedEnd < clippedStart) continue;
+          productionIntervals.push({ id: `history-${i}`, machineNumber, statusType: 'production', status: event.newStatus,
+            label: STATUS_LABELS[event.newStatus] || event.newStatus,
+            startedAt: new Date(clippedStart).toISOString(), endedAt: new Date(clippedEnd).toISOString(),
+            durationSec: Math.max(0, Math.floor((clippedEnd - clippedStart) / 1000)),
+            details: { reason: event.reason || '', source: event.source || '', ticketId: event.ticketId || '', operator: event.operatorName || '' } });
+        }
+        const [[current]] = await pool.execute(
+          'SELECT status,updatedAt,reason,source,ticketId,updatedByName FROM machine_production WHERE machineNumber = ? LIMIT 1',
+          [machineNumber]
+        );
+        if (productionIntervals.length === 0 && current && current.status) {
+          const start = new Date(Math.max(Date.parse(current.updatedAt) || Date.parse(dayStart), Date.parse(dayStart))).toISOString();
+          const endMs = Math.min(Date.now(), Date.parse(dayEnd));
+          productionIntervals.push({ id: `current-${machineNumber}`, machineNumber, statusType: 'production', status: current.status,
+            label: STATUS_LABELS[current.status] || current.status, startedAt: start, endedAt: null,
+            durationSec: Math.max(0, Math.floor((endMs - Date.parse(start)) / 1000)),
+            details: { reason: current.reason || '', source: current.source || '', ticketId: current.ticketId || '', operator: current.updatedByName || '' } });
+        }
+      }
+      sendJSON(res, {
+        success: true, machineNumber, date, intervals: intervals.filter(r => r.statusType === 'runtime'), productionIntervals,
+        summary: Object.fromEntries(Object.entries(summary).map(([k, seconds]) => [k, { seconds, label: STATUS_LABELS[k] || k }])) ,
+        productionSummary: Object.fromEntries(Object.entries(productionSummary).map(([k, seconds]) => [k, { seconds, label: STATUS_LABELS[k] || k }])),
+        statusMeta: STATUS_TIMELINE_META,
+      });
+    } catch (e) {
+      console.error('[Machine Status Interval] timeline error:', e.message);
+      sendJSON(res, { error: '状态时间轴查询失败' }, 500);
+    }
+  }
+
   async function loadProductionStatuses() {
     const [rows] = await pool.execute(
       'SELECT machineNumber,status,reason,source,ticketId,updatedBy,updatedByName,updatedAt FROM machine_production'
@@ -620,13 +872,18 @@ module.exports = function createMachinesHandlers(deps) {
         [machineNumber]
       );
       const prev = rows.length ? rows[0].status : null;
-      if (prev === status) return { ok: true, changed: false, from: prev, to: status };
+      if (prev === status) {
+        await recordStatusInterval(machineNumber, 'production', status, {
+          reason: opts.reason || '', source: opts.source || 'manual', ticketId: opts.ticketId || '', operator: opts.operator?.name || '',
+        });
+        return { ok: true, changed: false, from: prev, to: status };
+      }
 
       const now = new Date().toISOString();
       const reason = (opts.reason || '').slice(0, 500);
-      const source = opts.source === 'ticket' ? 'ticket' : 'manual';
-      const opId = opts.operator?.id || (source === 'ticket' ? 'system' : '');
-      const opName = opts.operator?.name || (source === 'ticket' ? '系统（工单联动）' : '');
+      const source = opts.source === 'ticket' || opts.source === 'recording' ? opts.source : 'manual';
+      const opId = opts.operator?.id || (source === 'ticket' ? 'system' : source === 'recording' ? 'agent' : '');
+      const opName = opts.operator?.name || (source === 'ticket' ? '系统（工单联动）' : source === 'recording' ? '边缘采集代理（录制）' : '');
 
       await pool.execute(
         `INSERT INTO machine_production (machineNumber,status,reason,source,ticketId,updatedBy,updatedByName,updatedAt)
@@ -646,6 +903,11 @@ module.exports = function createMachinesHandlers(deps) {
         'INSERT INTO machine_production_history (id,machineNumber,newStatus,data,createdAt) VALUES (?,?,?,?,?)',
         [histId, machineNumber, status, JSON.stringify(hist), now]
       );
+
+      // 生产状态也进入同一套区间表，日报可以和运行状态对齐展示。
+      await recordStatusInterval(machineNumber, 'production', status, {
+        reason, source, ticketId: opts.ticketId || '', operator: opName,
+      }, now);
 
       console.log(`[Production Status] ${machineNumber}: ${prev || '(无记录)'} -> ${status} (${source}${opts.ticketId ? ',ticket=' + opts.ticketId : ''})`);
       try { broadcastSSE('machines_updated', { machineNumber, productionStatus: status }); } catch {}
@@ -718,10 +980,35 @@ module.exports = function createMachinesHandlers(deps) {
     return n >= 1 && n <= 254 ? `10.5.51.${n}` : null;
   }
 
+  async function callAgent(machineNumber, path, { method = 'GET', body, timeout = 30000 } = {}) {
+    const ip = collectorIpOf(machineNumber);
+    if (!ip) return { ok: false, error: '无法解析目标机器地址' };
+    const token = process.env.EDGE_TOKEN || '';
+    if (!token) return { ok: false, error: '服务端未配置 EDGE_TOKEN' };
+    const response = await fetch(`http://${ip}:3000${path}`, {
+      method,
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'x-edge-token': token },
+      body: body == null ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(timeout),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return { ok: false, error: data.error || `Agent HTTP ${response.status}`, ...data };
+    return data;
+  }
+
+  async function runMachineCommandAgent(machineNumber, command, timeout = 30000) {
+    const result = await callAgent(machineNumber, '/exec', { method: 'POST', body: { cmd: command, timeout }, timeout });
+    return result.ok === false ? { ok: false, stderr: result.error } : { ok: true, stdout: result.output || result.stdout || '', ...result };
+  }
+
   async function _fetchCollectorJSON(url, timeoutMs) {
     const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { Accept: 'application/json' } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
+  }
+
+  async function runAgentArmControl(machineNumber, payload, timeout = 40000) {
+    return callAgent(machineNumber, '/arm-control', { method: 'POST', body: payload, timeout });
   }
 
   async function handleStopCollector(req, res, user, machineNumber) {
@@ -730,34 +1017,14 @@ module.exports = function createMachinesHandlers(deps) {
       if (!user || !['admin', 'superadmin'].includes(user.role)) {
         return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
       }
-      const ip = collectorIpOf(machineNumber);
-      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-      let hostOnline = false;
-      if (typeof loadEdgePresence === 'function') {
-        try {
-          const presence = await loadEdgePresence();
-          const ep = presence && presence[machineNumber];
-          hostOnline = !!(ep && ep.hostOnline);
-        } catch { }
-      }
-      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
-      const token = process.env.EDGE_TOKEN || '';
-      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-      const r = await fetch(`http://${ip}:3000/stop-collector`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(35000),
-        headers: { 'x-edge-token': token, Accept: 'application/json' },
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body.ok === false) {
-        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
-      }
+      const body = await callAgent(machineNumber, '/stop-collector', { method: 'POST', timeout: 35000 });
+      if (body.ok === false) return sendJSON(res, { error: body.error || 'Agent 执行失败' }, 502);
       broadcastChange('machines', null, { machineNumber });
       sendJSON(res, { success: true, container: body.container, machineNumber });
     } catch (e) {
       const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
       const msg = refused || e.name === 'TimeoutError'
-        ? '无法连接采集器主机上的心跳代理'
+        ? '无法连接目标机器 Agent'
         : (e.message || '操作失败');
       sendJSON(res, { error: msg }, 502);
     }
@@ -771,32 +1038,14 @@ module.exports = function createMachinesHandlers(deps) {
       }
       const ip = collectorIpOf(machineNumber);
       if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-      let hostOnline = false;
-      if (typeof loadEdgePresence === 'function') {
-        try {
-          const presence = await loadEdgePresence();
-          const ep = presence && presence[machineNumber];
-          hostOnline = !!(ep && ep.hostOnline);
-        } catch { }
-      }
-      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
-      const token = process.env.EDGE_TOKEN || '';
-      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-      const r = await fetch(`http://${ip}:3000/stop-exodus`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(35000),
-        headers: { 'x-edge-token': token, Accept: 'application/json' },
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body.ok === false) {
-        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
-      }
+      const body = await callAgent(machineNumber, '/stop-exodus', { method: 'POST', timeout: 35000 });
+      if (body.ok === false) return sendJSON(res, { error: body.error || 'Agent 执行失败' }, 502);
       broadcastChange('machines', null, { machineNumber });
       sendJSON(res, { success: true, container: body.container, machineNumber });
     } catch (e) {
       const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
       const msg = refused || e.name === 'TimeoutError'
-        ? '无法连接采集器主机上的心跳代理'
+        ? '无法连接目标机器 Agent'
         : (e.message || '操作失败');
       sendJSON(res, { error: msg }, 502);
     }
@@ -810,35 +1059,29 @@ module.exports = function createMachinesHandlers(deps) {
       }
       const ip = collectorIpOf(machineNumber);
       if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-      let hostOnline = false;
-      if (typeof loadEdgePresence === 'function') {
-        try {
-          const presence = await loadEdgePresence();
-          const ep = presence && presence[machineNumber];
-          hostOnline = !!(ep && ep.hostOnline);
-        } catch { }
-      }
-      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
-      const token = process.env.EDGE_TOKEN || '';
-      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-      const r = await fetch(`http://${ip}:3000/fix-quest`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(150000),
-        headers: { 'x-edge-token': token, Accept: 'application/json' },
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body.ok === false) {
-        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
-      }
+      const body = await callAgent(machineNumber, '/fix-quest', { method: 'POST', timeout: 150000 });
+      if (body.ok === false) return sendJSON(res, { error: body.error || 'Agent 执行失败' }, 502);
       broadcastChange('machines', null, { machineNumber });
-      sendJSON(res, { success: true, pid: body.pid || null, machineNumber });
+      sendJSON(res, { success: true, output: body.stdout || '', machineNumber, source: 'agent' });
     } catch (e) {
       const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
       const msg = refused || e.name === 'TimeoutError'
-        ? '无法连接采集器主机上的心跳代理'
+        ? '无法连接目标机器 Agent'
         : (e.message || '操作失败');
       sendJSON(res, { error: msg }, 502);
     }
+  }
+
+  async function handleQuestControl(req, res, user, machineNumber, body) {
+    try {
+      if (!user || !['admin', 'superadmin'].includes(user.role)) return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      const action = String(body?.action || '');
+      if (!['connect', 'disconnect'].includes(action)) return sendJSON(res, { error: '无效操作' }, 400);
+      const ip = collectorIpOf(machineNumber); if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      const out = await callAgent(machineNumber, '/quest-control', { method: 'POST', body: { action }, timeout: 30000 });
+      if (out.ok === false) return sendJSON(res, { error: out.error || 'Agent 执行失败' }, 502);
+      broadcastChange('machines', null, { machineNumber }); sendJSON(res,{success:true, action, machineNumber, output: out.stdout});
+    } catch(e) { sendJSON(res,{error:e.message || 'Quest 操作失败'},502); }
   }
 
   async function handleDiagnoseHands(req, res, user, machineNumber) {
@@ -849,37 +1092,22 @@ module.exports = function createMachinesHandlers(deps) {
       }
       const ip = collectorIpOf(machineNumber);
       if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-      let hostOnline = false;
-      if (typeof loadEdgePresence === 'function') {
-        try {
-          const presence = await loadEdgePresence();
-          const ep = presence && presence[machineNumber];
-          hostOnline = !!(ep && ep.hostOnline);
-        } catch { }
-      }
-      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
-      const token = process.env.EDGE_TOKEN || '';
-      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-      const r = await fetch(`http://${ip}:3000/diagnose-hands`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(175000),
-        headers: { 'x-edge-token': token, Accept: 'application/json' },
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body.ok === false) {
-        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
-      }
-      sendJSON(res, { success: true, hands: body.hands || [], machineNumber });
+      const requestUrl = new URL(req.url, 'http://x');
+      const requestedSide = (requestUrl.searchParams.get('side') || '').trim().toLowerCase();
+      const side = requestedSide === 'left' || requestedSide === 'right' ? requestedSide : 'all';
+      const body = await callAgent(machineNumber, `/diagnose-hands?side=${encodeURIComponent(side)}`, { method: 'POST', timeout: 175000 });
+      if (body.ok === false) return sendJSON(res, { error: body.error || 'Agent 执行失败' }, 502);
+      sendJSON(res, { success: true, ...body, machineNumber, side, source: 'agent' });
     } catch (e) {
       const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
       const msg = refused || e.name === 'TimeoutError'
-        ? '无法连接采集器主机上的心跳代理'
+        ? '无法连接目标机器 Agent'
         : (e.message || '操作失败');
       sendJSON(res, { error: msg }, 502);
     }
   }
 
-  // 灵巧手检测进度（agent 侧实时状态，前端轮询用）
+  // 灵巧手检测进度（目标机临时文件，前端轮询用）
   async function handleDiagnoseProgress(req, res, user, machineNumber) {
     try {
       if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
@@ -888,22 +1116,16 @@ module.exports = function createMachinesHandlers(deps) {
       }
       const ip = collectorIpOf(machineNumber);
       if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-      const token = process.env.EDGE_TOKEN || '';
-      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-      const r = await fetch(`http://${ip}:3000/diagnose-progress`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(8000),
-        headers: { 'x-edge-token': token, Accept: 'application/json' },
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body.ok === false) {
-        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
-      }
-      sendJSON(res, { success: true, progress: body.progress || null, machineNumber });
+      const requestUrl = new URL(req.url, 'http://x');
+      const requestedSide = (requestUrl.searchParams.get('side') || '').trim().toLowerCase();
+      const side = requestedSide === 'left' || requestedSide === 'right' ? requestedSide : 'all';
+      const body = await callAgent(machineNumber, `/diagnose-progress?side=${encodeURIComponent(side)}`, { timeout: 8000 });
+      if (body.ok === false) return sendJSON(res, { error: body.error || 'Agent 执行失败' }, 502);
+      sendJSON(res, { success: true, ...body, machineNumber, side, source: 'agent' });
     } catch (e) {
       const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
       const msg = refused || e.name === 'TimeoutError'
-        ? '无法连接采集器主机上的心跳代理'
+        ? '无法连接目标机器 Agent'
         : (e.message || '操作失败');
       sendJSON(res, { error: msg }, 502);
     }
@@ -917,21 +1139,38 @@ module.exports = function createMachinesHandlers(deps) {
       }
       const ip = collectorIpOf(machineNumber);
       if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-      const token = process.env.EDGE_TOKEN || '';
-      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-      const r = await fetch(`http://${ip}:3000/machine-config`, {
-        headers: { 'x-edge-token': token, Accept: 'application/json' },
-        signal: AbortSignal.timeout(15000),
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body.ok === false) {
-        return sendJSON(res, { error: body.error || `agent 返回 HTTP ${r.status}` }, 502);
+
+      const body = await callAgent(machineNumber, '/machine-config', { timeout: 15000 });
+      if (body.ok === false) return sendJSON(res, { error: body.error || 'Agent 无法读取机器配置', source: 'agent' }, 502);
+      const config = body && body.config && typeof body.config === 'object' ? body.config : body;
+      if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        return sendJSON(res, { error: 'Importer 返回的机器配置格式无效', source: 'agent' }, 502);
       }
-      sendJSON(res, { success: true, config: body.config, raw: body.raw });
+      return sendJSON(res, { success: true, config, raw: JSON.stringify(config, null, 2), source: 'agent-importer-api' });
     } catch (e) {
       const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
       const msg = refused || e.name === 'TimeoutError'
-        ? '无法连接采集器主机上的心跳代理'
+        ? '无法连接目标机器 Agent'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
+
+  async function handleMachineProbe(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      const health = await callAgent(machineNumber, '/health', { timeout: 30000 });
+      if (health.ok === false) return sendJSON(res, { error: health.error || 'Agent 探针执行失败' }, 502);
+      sendJSON(res, { success: true, machineNumber, health, checkedAt: new Date().toISOString(), source: 'agent' });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接目标机器 Agent'
         : (e.message || '操作失败');
       sendJSON(res, { error: msg }, 502);
     }
@@ -939,9 +1178,9 @@ module.exports = function createMachinesHandlers(deps) {
 
   // ==================== 通用命令按钮注册表 ====================
   // 前端"维护操作"面板的命令按钮即由本表生成；新增按钮只需在此加一行
-  // cmd 必须能被 gms-heartbeat-agent 的 /exec 白名单匹配
+  // 命令同时受服务端与 Agent 白名单限制。
   const MACHINE_COMMANDS = [
-    { key: 'container-ps', label: '查看容器状态', cmd: 'docker ps -a', danger: false, timeout: 10000, showOutput: true },
+    { key: 'container-ps', label: '查看容器状态', cmd: 'docker ps', danger: false, timeout: 10000, showOutput: true },
   ];
 
   async function handleMachineCommands(req, res, user, machineNumber) {
@@ -966,27 +1205,8 @@ module.exports = function createMachinesHandlers(deps) {
       if (!cmdDef) return sendJSON(res, { error: '未知命令: ' + key }, 400);
       const ip = collectorIpOf(machineNumber);
       if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-      let hostOnline = false;
-      if (typeof loadEdgePresence === 'function') {
-        try {
-          const presence = await loadEdgePresence();
-          const ep = presence && presence[machineNumber];
-          hostOnline = !!(ep && ep.hostOnline);
-        } catch { }
-      }
-      if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
-      const token = process.env.EDGE_TOKEN || '';
-      if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-      const r = await fetch(`http://${ip}:3000/exec`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(cmdDef.timeout + 5000),
-        headers: { 'x-edge-token': token, Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cmd: cmdDef.cmd, timeout: cmdDef.timeout }),
-      });
-      const body2 = await r.json().catch(() => ({}));
-      if (!r.ok || body2.ok === false) {
-        return sendJSON(res, { error: body2.error || `agent 返回 HTTP ${r.status}` }, 502);
-      }
+      const body2 = await runMachineCommandAgent(machineNumber, cmdDef.cmd, cmdDef.timeout + 5000);
+      if (!body2.ok) return sendJSON(res, { error: body2.stderr || 'Agent 执行失败' }, 502);
       if (cmdDef.showOutput) {
         return sendJSON(res, { success: true, output: body2.stdout || '', cmd: cmdDef.cmd, machineNumber });
       }
@@ -995,62 +1215,54 @@ module.exports = function createMachinesHandlers(deps) {
     } catch (e) {
       const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
       const msg = refused || e.name === 'TimeoutError'
-        ? '无法连接采集器主机上的心跳代理'
+        ? '无法连接目标机器 Agent'
         : (e.message || '操作失败');
       sendJSON(res, { error: msg }, 502);
     }
   }
 
-  /*
-   * 机械臂状态切换功能暂未启用（SDK 硬编码绑定 UDP 4730，与 mono 采集器占用冲突），先注释掉
-   */
-  // async function handleArmControl(req, res, user, machineNumber, body) {
-  //   try {
-  //     if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
-  //     if (!user || !['admin', 'superadmin'].includes(user.role)) {
-  //       return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
-  //     }
-  //     body = body || {};
-  //     const action = body.action;
-  //     const arm = (body.arm || 'A').toUpperCase();
-  //     const state = body.state !== undefined ? parseInt(body.state, 10) : undefined;
-  //     if (!action) return sendJSON(res, { error: '缺少 action 参数' }, 400);
-  //     if (!['A','B','AB'].includes(arm)) return sendJSON(res, { error: 'arm 必须为 A、B 或 AB' }, 400);
-  //     if (action === 'set_state' && (isNaN(state) || state < 0 || state > 4)) {
-  //       return sendJSON(res, { error: 'state 必须为 0-4: 0=下伺服 1=位置跟随 2=PVT 3=扭矩 4=协作释放' }, 400);
-  //     }
-  //     const ip = collectorIpOf(machineNumber);
-  //     if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
-  //     let hostOnline = false;
-  //     if (typeof loadEdgePresence === 'function') {
-  //       try {
-  //         const presence = await loadEdgePresence();
-  //         const ep = presence && presence[machineNumber];
-  //         hostOnline = !!(ep && ep.hostOnline);
-  //       } catch { }
-  //     }
-  //     if (!hostOnline) return sendJSON(res, { error: '该机器未部署心跳代理或代理离线' }, 400);
-  //     const token = process.env.EDGE_TOKEN || '';
-  //     if (!token) return sendJSON(res, { error: '服务端未配置 EDGE_TOKEN' }, 500);
-  //     const r = await fetch(`http://${ip}:3000/arm-control`, {
-  //       method: 'POST',
-  //       signal: AbortSignal.timeout(35000),
-  //       headers: { 'x-edge-token': token, 'Content-Type': 'application/json', Accept: 'application/json' },
-  //       body: JSON.stringify({ action, arm, state: isNaN(state) ? undefined : state }),
-  //     });
-  //     const result = await r.json().catch(() => ({}));
-  //     if (!r.ok || result.ok === false) {
-  //       return sendJSON(res, { error: result.error || `agent 返回 HTTP ${r.status}` }, 502);
-  //     }
-  //     sendJSON(res, { success: true, ...result, machineNumber });
-  //   } catch (e) {
-  //     const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
-  //     const msg = refused || e.name === 'TimeoutError'
-  //       ? '无法连接采集器主机上的心跳代理'
-  //       : (e.message || '操作失败');
-  //     sendJSON(res, { error: msg }, 502);
-  //   }
-  // }
+  async function handleArmControl(req, res, user, machineNumber, body) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      if (!user || !['admin', 'superadmin'].includes(user.role)) {
+        return sendJSON(res, { error: '仅管理员可执行此操作' }, 403);
+      }
+      body = body || {};
+      const action = String(body.action || '');
+      const arm = String(body.arm || 'A').toUpperCase();
+      const state = body.state !== undefined ? parseInt(body.state, 10) : undefined;
+      const validActions = ['connect', 'disconnect', 'exit', 'set_state', 'clear_error', 'soft_stop', 'get_errors', 'disable', 'set_joint_mode', 'set_impedance_joint', 'set_impedance_cart', 'joint_drag', 'cart_drag', 'exit_drag', 'set_tool'];
+      if (!validActions.includes(action)) {
+        return sendJSON(res, { error: '无效操作' }, 400);
+      }
+      if (!['A', 'B', 'AB'].includes(arm)) return sendJSON(res, { error: 'arm 必须为 A、B 或 AB' }, 400);
+      if (action === 'set_state' && (isNaN(state) || state < 0 || state > 4)) {
+        return sendJSON(res, { error: 'state 必须为 0-4' }, 400);
+      }
+      if (['set_joint_mode', 'set_impedance_joint', 'set_impedance_cart'].includes(action)) {
+        const velRatio = Number(body.velRatio);
+        const accRatio = Number(body.accRatio);
+        if (!Number.isInteger(velRatio) || velRatio < 1 || velRatio > 100 || !Number.isInteger(accRatio) || accRatio < 1 || accRatio > 100) {
+          return sendJSON(res, { error: 'velRatio/accRatio 必须为 1-100 的整数' }, 400);
+        }
+      }
+      const ip = collectorIpOf(machineNumber);
+      if (!ip) return sendJSON(res, { error: '该机器未部署采集器' }, 400);
+      const result = await runAgentArmControl(machineNumber, {
+        action, arm, state: isNaN(state) ? undefined : state,
+        velRatio: body.velRatio, accRatio: body.accRatio, stiffness: body.stiffness, damping: body.damping,
+        rotType: body.rotType, cartCtrlPara: body.cartCtrlPara, direction: body.direction, kinePara: body.kinePara, dynPara: body.dynPara,
+      }, 40000);
+      if (result.ok === false || result.success === false) return sendJSON(res, { error: result.error || 'Agent SDK 执行失败', ...result }, 502);
+      sendJSON(res, { success: true, ...result, machineNumber });
+    } catch (e) {
+      const refused = e.cause && (e.cause.code === 'ECONNREFUSED' || e.cause.code === 'ETIMEDOUT');
+      const msg = refused || e.name === 'TimeoutError'
+        ? '无法连接目标机器 Agent 或机械臂 SDK'
+        : (e.message || '操作失败');
+      sendJSON(res, { error: msg }, 502);
+    }
+  }
 
   function _stateTopicMap(state) {
     const items = (state && state.robots && state.robots.robot_1) || [];
@@ -1087,7 +1299,7 @@ module.exports = function createMachinesHandlers(deps) {
     return out;
   }
 
-  // 心跳代理会把 Wuji SDK 的详细诊断放在 wuji，同时把兼容摘要放在
+  // Agent 探针把 Wuji SDK 的详细诊断放在 wuji，同时把兼容摘要放在
   // devices.devicesNet。这里统一补齐 devicesNet，保证“机器状态”所有
   // 读取路径（数据库快照、实时 SSE、直连抓取）都能看到同一套字段。
   function _mergeWujiDevices(devicesNet, wuji) {
@@ -1122,7 +1334,15 @@ module.exports = function createMachinesHandlers(deps) {
   function _edgeInfoFromPresence(ep) {
     if (!ep) return null;
     return {
+      collectorStarted: ep.collectorStarted !== false
+        && ep.edgeContainerRoleStatus?.collector?.running !== false,
       machineType: ep.machineType || null,
+      machineTypeReason: ep.machineTypeReason || null,
+      machineTypeConfidence: ep.machineTypeConfidence || null,
+      machineTypeEvidence: ep.machineTypeEvidence || null,
+      machineProfile: ep.machineProfile || null,
+      importer: ep.importer || null,
+      marvinBroker: ep.edgeMarvinBroker || null,
       devicesNet: _mergeWujiDevices(ep.edgeDevices || null, ep.edgeWuji || null),
       questInfo: ep.edgeQuest ? {
         netConnected: !!ep.edgeQuest.connected,
@@ -1138,7 +1358,107 @@ module.exports = function createMachinesHandlers(deps) {
       encoderFps: ep.edgeEncoderFps || null,
       wuji: ep.edgeWuji || null,
       handStream: ep.edgeHandStream || null,
+      health: ep.edgeHealth || null,
+      containers: ep.edgeContainers || [],
+      containerRoles: ep.edgeContainerRoles || {},
+      containerRoleStatus: ep.edgeContainerRoleStatus || {},
+      hostDisks: ep.edgeHostDisks || {},
+      host: ep.edgeHost || {},
     };
+  }
+
+  function _normalizeMachineType(value) {
+    const type = String(value || '').trim().toLowerCase();
+    if (['glove_only', 'glove-only', 'glove', 'glove_system', 'glove-system', '纯手套', '纯手套机器', '手套'].includes(type)) return 'glove_only';
+    if (['dexterous', 'dexterous_hand', 'dexterous-hand', 'robot', 'robotic', 'robotic_arm', '灵巧手', '灵巧手机器', '机械臂'].includes(type)) return 'dexterous';
+    return null;
+  }
+
+  const machineTypeOverrides = (() => {
+    const map = Object.create(null);
+    const raw = process.env.MACHINE_TYPE_OVERRIDES || 'we-051=dexterous';
+    for (const item of String(raw).split(',')) {
+      const [key, value] = item.split('=').map(v => String(v || '').trim().toLowerCase());
+      const type = _normalizeMachineType(value);
+      if (!key || !type) continue;
+      map[key] = type;
+      const match = key.match(/^(?:we|szx3)-0*(\d+)$/);
+      if (match) map[match[1]] = type;
+    }
+    return map;
+  })();
+
+  function _machineTypeOverride(machineNumber) {
+    const raw = String(machineNumber || '').trim().toLowerCase();
+    const short = raw.match(/^(?:we|szx3)-0*(\d+)$/);
+    return machineTypeOverrides[raw] || (short && machineTypeOverrides[short[1]]) || null;
+  }
+
+  function _applyMachineTypeOverride(record) {
+    if (!record || !record.machineNumber) return record;
+    const type = _machineTypeOverride(record.machineNumber);
+    if (!type) return record;
+    return {
+      ...record,
+      machineType: type,
+      machineTypeReason: 'machine_type_override',
+      machineTypeConfidence: 'high',
+      deviceType: type === 'dexterous' ? 'dexterous' : 'glove',
+    };
+  }
+
+  function _deriveMachineType(machineNumber, explicit, devicesNet, components, importer, explicitReason) {
+    const overrideType = _machineTypeOverride(machineNumber);
+    if (overrideType) return overrideType;
+    const explicitType = _normalizeMachineType(explicit);
+    const importerMachineId = String(importer && (importer.machineId || importer.machine_id) || '');
+    const importerUnit = String(importer && (importer.commanderUnit || importer.commander?.unit) || '');
+    if (/iris/i.test(importerMachineId) || /^iris$/i.test(importerUnit)) return 'dexterous';
+    // 显式配置优先；其它值仍需让 Importer 配置校正。
+    if (explicitReason === 'configured' && (explicitType === 'glove_only' || explicitType === 'dexterous')) {
+      return explicitType;
+    }
+    const importerType = _normalizeMachineType(importer && (importer.machineType || importer.machine_type));
+    if (importerType === 'glove_only' || importerType === 'dexterous') return importerType;
+    // 直连 Hermes core/health 时可能只带原始 machine_config；即使没有
+    // 即使没有经过额外规范化，也按 Importer 配置中的设备槽位识别。
+    const normalizedSlots = [
+      ...(importer && Array.isArray(importer.gelloSlots) ? importer.gelloSlots : []),
+      ...(importer && Array.isArray(importer.gloveSlots) ? importer.gloveSlots : []),
+      ...(importer && Array.isArray(importer.robotSlots) ? importer.robotSlots : []),
+    ].map(String);
+    if (normalizedSlots.some(name => /(?:wuji_hand|dexterous|marvin|robotic_arm|robot_arm|gripper)/i.test(name))) return 'dexterous';
+    if (normalizedSlots.some(name => /(?:wuji_glove|glove)/i.test(name))) return 'glove_only';
+    // 只有带有 config 原文时才递归扫描；规范化 profile 中的字段名
+    //（例如 gloveSlots）不是硬件槽位，不能单凭字段名判成纯手套。
+    const importerRoot = importer && importer.config && typeof importer.config === 'object'
+      ? importer.config
+      : (importer && (importer.commander || importer.robot || importer.robots
+        || importer.robotic_arm || importer.robot_arm) ? importer : null);
+    const importerNames = [];
+    const collectNames = (value, key = '') => {
+      if (key) importerNames.push(String(key));
+      if (!value || typeof value !== 'object') {
+        return;
+      }
+      for (const [childKey, child] of Object.entries(value)) collectNames(child, childKey);
+    };
+    if (importerRoot) {
+      collectNames(importerRoot);
+      if (importerNames.some(name => /(?:wuji_hand|dexterous|marvin|robotic_arm|robot_arm|gripper)/i.test(name))) return 'dexterous';
+      if (importerNames.some(name => /(?:wuji_glove|glove)/i.test(name))) return 'glove_only';
+    }
+    if (['configured', 'importer_config'].includes(explicitReason)
+      && (explicitType === 'glove_only' || explicitType === 'dexterous')) return explicitType;
+    const d = devicesNet || {};
+    const hands = d.dexterousHands || {};
+    if ((hands.left && hands.left.connected) || (hands.right && hands.right.connected)
+      || (d.roboticArm && d.roboticArm.connected)) return 'dexterous';
+    const keys = Object.keys(components || {});
+    if (keys.some(key => key === 'robot/wuji_hand_l' || key === 'robot/wuji_hand_r' || key === 'robot/marvin')) return 'dexterous';
+    const match = /^(?:we|szx3)-(\d+)$/.exec(String(machineNumber || '').toLowerCase());
+    if (match) return parseInt(match[1], 10) < 100 ? 'glove_only' : 'dexterous';
+    return null;
   }
 
   function _composeLiveInfo(machineNumber, settled, edge) {
@@ -1153,6 +1473,14 @@ module.exports = function createMachinesHandlers(deps) {
     const devices = _groupComponents(ciInfo.components || (hermesHealth && hermesHealth.components) || {}, hermesHealth && hermesHealth.components);
 
     const dnet = _mergeWujiDevices(edge && edge.devicesNet, edge && edge.wuji);
+    const machineType = _deriveMachineType(
+      machineNumber,
+      edge && edge.machineType,
+      dnet,
+      ciInfo.components || (hermesHealth && hermesHealth.components),
+      (edge && edge.importer) || (core && core.machine_config),
+      edge && edge.machineTypeReason,
+    );
     if (dnet) {
       const probe = (obj, hand) => (obj && hand && obj[hand] && typeof obj[hand].connected === 'boolean')
         ? !!obj[hand].connected : null;
@@ -1164,7 +1492,7 @@ module.exports = function createMachinesHandlers(deps) {
         devices.marvin.probeConnected = !!dnet.roboticArm.connected;
       }
     }
-    if (edge && edge.machineType === 'glove_only') {
+    if (machineType === 'glove_only') {
       devices.dexterousHands = { left: null, right: null };
       devices.marvin = null;
     }
@@ -1183,7 +1511,9 @@ module.exports = function createMachinesHandlers(deps) {
       endTime: tc.end_time || null,
       isTraining: !!tpl.is_training,
       operator: {
+        id: tc.operator_id || op.id || null,
         name: op.name || op.localized_name || '未知',
+        localizedName: op.localized_name || null,
         level: op.level != null ? op.level : null,
         email: op.email || null,
         state: op.state || null,
@@ -1194,7 +1524,10 @@ module.exports = function createMachinesHandlers(deps) {
     } : null;
 
     const misc = (core && core.machine_config && core.machine_config.misc) || {};
-    const containers = Object.entries((core && core.containers) || {}).map(([name, status]) => ({ name, status }));
+    const edgeContainers = edge && Array.isArray(edge.containers) ? edge.containers : [];
+    const containers = edgeContainers.length
+      ? edgeContainers
+      : Object.entries((core && core.containers) || {}).map(([name, status]) => ({ name, status }));
 
     const _refused = r => {
       if (r.status !== 'rejected') return false;
@@ -1207,6 +1540,16 @@ module.exports = function createMachinesHandlers(deps) {
     return {
       success: true,
       machineNumber,
+      machineType,
+      machineTypeReason: (edge && edge.importer && edge.importer.machineTypeReason)
+        || (edge && edge.machineTypeReason) || null,
+      machineTypeConfidence: (edge && edge.importer && edge.importer.machineTypeConfidence)
+        || (edge && edge.machineTypeConfidence) || null,
+      machineTypeEvidence: (edge && edge.importer && edge.importer.machineTypeEvidence)
+        || (edge && edge.machineTypeEvidence) || null,
+      machineProfile: (edge && edge.machineProfile) || null,
+      marvinBroker: (edge && edge.marvinBroker) || null,
+      importer: (edge && edge.importer) || null,
       source: 'live',
       dataAgeSec: 0,
       collectorName: misc.machine_id || null,
@@ -1231,6 +1574,7 @@ module.exports = function createMachinesHandlers(deps) {
       encoderFps: (edge && edge.encoderFps) || null,
       wuji: (edge && edge.wuji) || null,
       handStream: (edge && edge.handStream) || null,
+      host: (edge && edge.host) || {},
       system: {
         activity: (core && core.activity) || null,
         collectorAlive: !!(core && core.is_collector_alive),
@@ -1243,6 +1587,8 @@ module.exports = function createMachinesHandlers(deps) {
         errorCount: stateMap.error_count != null ? stateMap.error_count : (ciInfo.errors ? ciInfo.errors.length : 0),
       },
       containers,
+      containerRoles: (edge && edge.containerRoles) || {},
+      containerRoleStatus: (edge && edge.containerRoleStatus) || {},
       devices,
       task,
       degraded: ciInfo.degraded || (hermesHealth && hermesHealth.degraded) || [],
@@ -1262,17 +1608,14 @@ module.exports = function createMachinesHandlers(deps) {
       const ip = collectorIpOf(machineNumber);
       if (!ip) return sendJSON(res, { error: '该机器未部署采集器（仅 we-1xx / szx3-* 灵巧手机器提供）' }, 400);
 
-      const url = new URL(req.url, 'http://x');
-      const forceLive = url.searchParams.get('refresh') === '1';
-
       let edgePresence = null;
       try {
-        const presence = await loadEdgePresence();
+        const presence = await loadAgentPresence();
         edgePresence = presence && presence[machineNumber] ? presence[machineNumber] : null;
       } catch { }
 
       let snap = null;
-      if (!forceLive && edgePresence && edgePresence.hostLastSeen
+      if (edgePresence && edgePresence.hostLastSeen
         && Date.now() - new Date(edgePresence.hostLastSeen).getTime() < 90 * 1000
         && (edgePresence.hostOnline || edgePresence.importer || edgePresence.hermes
           || edgePresence.edgeDevices || edgePresence.edgeWuji
@@ -1316,7 +1659,15 @@ module.exports = function createMachinesHandlers(deps) {
             devices.marvin.probeConnected = !!dnet0.roboticArm.connected;
           }
         }
-        if (snap.machineType === 'glove_only') {
+        const snapMachineType = _deriveMachineType(
+          machineNumber,
+          snap.machineType,
+          dnet0,
+          comps,
+          imp,
+          snap.machineTypeReason,
+        );
+        if (snapMachineType === 'glove_only') {
           devices.dexterousHands = { left: null, right: null };
           devices.marvin = null;
         }
@@ -1333,6 +1684,7 @@ module.exports = function createMachinesHandlers(deps) {
           endTime: it.endTime || null,
           isTraining: !!(it.template && it.template.isTraining),
           operator: {
+            id: it.operatorId || (it.operator && it.operator.id) || null,
             name: (it.operator && (it.operator.name || it.operator.localized_name)) || '未知',
             level: it.operator ? it.operator.level : null,
             email: null,
@@ -1349,6 +1701,14 @@ module.exports = function createMachinesHandlers(deps) {
         sendJSON(res, {
           success: true,
           machineNumber,
+          collectorStarted: snap.collectorStarted !== false
+            && snap.edgeContainerRoleStatus?.collector?.running !== false,
+          machineType: snapMachineType,
+          machineTypeReason: imp.machineTypeReason || snap.machineTypeReason || null,
+          machineTypeConfidence: imp.machineTypeConfidence || snap.machineTypeConfidence || null,
+          machineTypeEvidence: imp.machineTypeEvidence || snap.machineTypeEvidence || null,
+          machineProfile: snap.machineProfile || null,
+          importer: imp,
           source: 'agent',
           dataAgeSec: Math.max(0, Math.round((Date.now() - new Date(snap.hostLastSeen).getTime()) / 1000)),
           collectorName: imp.machineId || null,
@@ -1364,7 +1724,14 @@ module.exports = function createMachinesHandlers(deps) {
           cameras: snap.edgeCameras || [],
           encoderFps: snap.edgeEncoderFps || null,
           wuji: snap.edgeWuji || null,
+          marvinBroker: snap.edgeMarvinBroker || null,
           handStream: snap.edgeHandStream || null,
+          health: snap.edgeHealth || null,
+          containers: snap.edgeContainers || [],
+          containerRoles: snap.edgeContainerRoles || {},
+          containerRoleStatus: snap.edgeContainerRoleStatus || {},
+          hostDisks: snap.edgeHostDisks || {},
+          host: snap.edgeHost || {},
           sensors,
           teleopDelay: (her.state && her.state.teleopDelay) || null,
           questInfo: q ? {
@@ -1400,10 +1767,15 @@ module.exports = function createMachinesHandlers(deps) {
             errorCount: her.state && her.state.errorCount != null ? her.state.errorCount
               : (her.health ? (her.health.errors || []).length : 0),
           },
-          containers: [
-            { name: 'importer', status: imp.reachable === false ? 'exited' : 'running' },
-            { name: '采集程序(rdc-exodus)', status: herDown ? 'exited' : 'running' },
-          ],
+          containers: (Array.isArray(snap.edgeContainers) && snap.edgeContainers.length)
+            ? snap.edgeContainers
+            : [
+              { name: 'importer', status: imp.reachable === false ? 'exited' : 'running' },
+              { name: snap.containerRoleStatus && snap.containerRoleStatus.collector
+                ? snap.containerRoleStatus.collector.name : '采集程序', status: herDown ? 'exited' : 'running' },
+            ],
+          containerRoles: snap.edgeContainerRoles || {},
+          containerRoleStatus: snap.edgeContainerRoleStatus || {},
           devices,
           task,
           degraded: (her.health && her.health.degraded) || [],
@@ -1417,27 +1789,197 @@ module.exports = function createMachinesHandlers(deps) {
         return;
       }
 
-      const base = `http://${ip}`;
-      const settled = await Promise.allSettled([
-        _fetchCollectorJSON(`${base}:5025/api/core/health`, 6000),
-        _fetchCollectorJSON(`${base}:5006/health`, 4000),
-        _fetchCollectorJSON(`${base}:5006/version`, 4000),
-        _fetchCollectorJSON(`${base}:5006/state`, 4000),
-        _fetchCollectorJSON(`${base}:5006/sensors`, 4000),
-      ]);
-      // 即使本次选择直连采集器（refresh=1 或心跳暂时不可用），只要
-      // edge_hosts 里还有新鲜的代理快照，也一并带回机器状态，避免
-      // “实时刷新”时 FPS/Wuji 状态突然消失。
-      sendJSON(res, _composeLiveInfo(
+      sendJSON(res, {
+        success: false,
         machineNumber,
-        settled,
-        edgePresence && edgePresence.hostLastSeen
-          && Date.now() - new Date(edgePresence.hostLastSeen).getTime() < 90 * 1000
-          ? _edgeInfoFromPresence(edgePresence) : null,
-      ));
+        hostOnline: false,
+        source: 'agent',
+        error: edgePresence?.agentError || '尚未取得有效 Agent 快照',
+      }, 503);
     } catch (e) {
       console.error('[Machine Info] Error:', e);
       sendJSON(res, { error: '服务器内部错误' }, 500);
+    }
+  }
+
+  // Operations dashboard aggregate: read-only snapshot of Importer/Hermes state.
+  async function handleGetOperationsCenter(req, res, user, machineNumber) {
+    try {
+      if (!machineNumber) return sendJSON(res, { error: '机器编号不能为空' }, 400);
+      // Agent-first path: use the latest read-only Importer/Hermes snapshot
+      // persisted by the edge heartbeat. This avoids opening eight HTTP
+      // connections to the target machine for every dashboard refresh.
+      try {
+        const [agentRows] = await pool.execute(
+          "SELECT data, lastSeen FROM edge_hosts WHERE machineNumber = ? AND agentVersion IS NOT NULL AND agentVersion <> '' ORDER BY updatedAt DESC LIMIT 1",
+          [machineNumber]
+        );
+        const row = agentRows[0];
+        const live = getEdgeLive(machineNumber);
+        if (live && live.importer && Date.now() - live.ts < 10000) {
+          agentRows.unshift({ data: JSON.stringify(live), lastSeen: new Date(live.ts).toISOString() });
+        }
+        const effectiveRow = agentRows[0];
+        const age = effectiveRow && effectiveRow.lastSeen ? Date.now() - new Date(effectiveRow.lastSeen).getTime() : Infinity;
+        if (effectiveRow && age >= 0 && age < 120000) {
+          let snap = {};
+          try { snap = JSON.parse(effectiveRow.data || '{}'); } catch {}
+          const importer = snap.importer || {};
+          const health = importer.health || importer.maintenanceHealth || importer;
+          const task = importer.task && importer.task.id ? importer.task : null;
+          const machineConfig = importer.machine || importer.machineConfig || health.machine_config || {};
+          const episodesRaw = importer.episodes || importer.episodeRecords || [];
+          const episodes = Array.isArray(episodesRaw) ? episodesRaw : (episodesRaw.items || []);
+          const since = Number(new URL(req.url, 'http://x').searchParams.get('since')) || new Date().setHours(0, 0, 0, 0) / 1000;
+          const until = Number(new URL(req.url, 'http://x').searchParams.get('until')) || (since + 86400);
+          const uploaded = episodes.filter(item => { const at = Number(item.occurred_at ?? item.updated_at ?? 0); return !at || (at >= since && at < until); });
+          const overview = importer.overview || importer.operationsOverview || {};
+          const processor = importer.processorOverview || importer.dataProcessing || importer.processingOverview || importer.processing || {};
+          const quality = importer.quality || overview.quality || null;
+          const operator = task?.operator || {};
+          const template = task?.template || {};
+          return sendJSON(res, {
+            success: true, machineNumber, generatedAt: Date.now() / 1000,
+            period: { since, until, timezone: 'local' },
+            login: { loggedIn: health.is_logged_in ?? importer.loggedIn ?? null, idleTimeSecs: health.idle_time_secs ?? null, activity: health.activity ?? null },
+            machine: { machineId: machineConfig?.misc?.machine_id || importer.machineId || null, computerId: machineConfig?.misc?.computer_id || importer.computerId || null, importerVersion: health.version || importer.importerVersion || importer.version || null, workflow: machineConfig?.collector?.workflow || importer.workflow || null, collectorType: machineConfig?.collector?.type || importer.collectorType || null },
+            task: task ? { id: task.id, state: task.state || null, name: template.ref_name || template.name || null, training: !!template.is_training, operator: { id: task.operator_id || operator.id || null, name: operator.name || operator.localized_name || null, localizedName: operator.localized_name || null, level: operator.level ?? null } } : null,
+            processing: { workers: importer.workers || processor.workers || [], queue: importer.queue || null, workflows: importer.processing?.workflows || importer.workflows || [], pending: processor.pending ?? null, busy: processor.busy ?? null, stalled: processor.stalled ?? null, done: processor.done ?? null, total: processor.total ?? null, episodes: processor.episodes || [] },
+            uploads: { episodeCount: uploaded.length, sizeBytes: 0, sizeKnown: false, returnedCount: episodes.length, nextCursor: episodesRaw?.next_cursor ?? null },
+            sessions: { attendedSeconds: overview.attended_seconds ?? null, items: overview.sessions || [], runs: overview.runs || [], attempts: overview.attempts || {} },
+            quality: { pass: quality?.pass ?? null, fail: quality?.fail ?? null, error: quality?.error ?? null },
+            qualityPassRate: importer.qualityPassRate ?? overview.quality_pass_rate ?? null,
+            latestMcapReport: importer.latestMcapReport ?? overview.latest_mcap_report ?? null,
+            recentMcapReports: importer.recentMcapReports || overview.recent_mcap_reports || [],
+            recentFailures: importer.recentFailures || overview.recent_failures || [],
+            faults: importer.faults || overview.faults || {},
+            source: 'agent', dataAgeSec: Math.round(age / 1000), sourceErrors: importer.endpointErrors || snap.sourceErrors || {},
+          }, 200);
+        }
+      } catch (agentErr) {
+        console.warn('[Operations Center] Agent snapshot unavailable:', agentErr.message);
+      }
+
+      // 运营中心统一使用 Agent 快照，避免服务端直接连接目标机造成竞争和阻塞。
+      return sendJSON(res, {
+        success: false,
+        machineNumber,
+        source: 'agent',
+        error: 'Agent 尚未上报运营中心数据',
+      }, 503);
+
+      const query = new URL(req.url, 'http://x').searchParams;
+      const now = Date.now() / 1000;
+      const startOfDay = new Date();
+      startOfDay.setHours(0, 0, 0, 0);
+      const nextDay = new Date(startOfDay.getTime() + 86400000);
+      const since = Number(query.get('since')) || startOfDay.getTime() / 1000;
+      const until = Number(query.get('until')) || nextDay.getTime() / 1000;
+      const base = `http://${ip}:5025`;
+      const requests = {
+        health: `${base}/api/maintenance/health`,
+        task: `${base}/api/config/task`,
+        machine: `${base}/api/config/machine`,
+        workers: `${base}/api/data/processing/workers/status`,
+        queue: `${base}/api/data/processing/process_queue/status`,
+        processing: `${base}/api/data/processing/overall`,
+        episodes: `${base}/api/data/episodes/records`,
+        overview: `${base}/api/operations/overview?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
+      };
+      const entries = Object.entries(requests);
+      const settled = await Promise.allSettled(entries.map(([, url]) => _fetchCollectorJSON(url, 8000)));
+      const raw = {};
+      const errors = {};
+      entries.forEach(([name], i) => {
+        if (settled[i].status === 'fulfilled') raw[name] = settled[i].value;
+        else errors[name] = settled[i].reason?.message || '请求失败';
+      });
+
+      const task = raw.task && raw.task.id ? raw.task : null;
+      const template = task?.template || {};
+      const operator = task?.operator || {};
+      const machineConfig = raw.machine || raw.health?.machine_config || {};
+      const episodes = Array.isArray(raw.episodes) ? raw.episodes : (raw.episodes?.items || []);
+      const uploadedEpisodes = episodes.filter(item => {
+        if (item.category && item.category !== 'episode') return false;
+        const at = Number(item.occurred_at ?? item.updated_at ?? 0);
+        return !at || (at >= since && at < until);
+      });
+      const sizeBytes = uploadedEpisodes.reduce((sum, item) => {
+        const value = item?.payload?.size_bytes;
+        const n = value == null ? NaN : Number(value);
+        return Number.isFinite(n) ? sum + n : sum;
+      }, 0);
+      const sizeKnown = uploadedEpisodes.some(item => {
+        const value = item?.payload?.size_bytes;
+        return value != null && Number.isFinite(Number(value));
+      });
+      const overview = raw.overview || {};
+      const health = raw.health || {};
+      const workflow = machineConfig?.collector?.workflow || health?.machine_config?.collector?.workflow || null;
+
+      sendJSON(res, {
+        success: true,
+        machineNumber,
+        generatedAt: now,
+        period: { since, until, timezone: 'local' },
+        login: {
+          loggedIn: health.is_logged_in ?? null,
+          idleTimeSecs: health.idle_time_secs ?? null,
+          activity: health.activity ?? null,
+        },
+        machine: {
+          machineId: machineConfig?.misc?.machine_id || null,
+          computerId: machineConfig?.misc?.computer_id || null,
+          importerVersion: health.version || null,
+          workflow,
+          collectorType: machineConfig?.collector?.type || null,
+        },
+        task: task ? {
+          id: task.id,
+          state: task.state || null,
+          name: template.ref_name || template.name || null,
+          training: !!template.is_training,
+          operator: {
+            id: task.operator_id || operator.id || null,
+            name: operator.name || operator.localized_name || null,
+            localizedName: operator.localized_name || null,
+            level: operator.level ?? null,
+          },
+        } : null,
+        processing: {
+          workers: raw.workers || raw.processing?.workers || [],
+          queue: raw.queue || null,
+          workflows: raw.processing?.workflows || [],
+        },
+        uploads: {
+          episodeCount: uploadedEpisodes.length,
+          sizeBytes: sizeKnown ? sizeBytes : null,
+          sizeKnown,
+          returnedCount: episodes.length,
+          nextCursor: raw.episodes?.next_cursor ?? null,
+        },
+        sessions: {
+          attendedSeconds: overview.attended_seconds ?? null,
+          items: overview.sessions || [],
+          runs: overview.runs || [],
+          attempts: overview.attempts || {},
+        },
+        quality: {
+          pass: overview.quality?.pass ?? null,
+          fail: overview.quality?.fail ?? null,
+          error: overview.quality?.error ?? null,
+        },
+        qualityPassRate: overview.quality_pass_rate ?? null,
+        latestMcapReport: overview.latest_mcap_report ?? null,
+        recentMcapReports: overview.recent_mcap_reports || [],
+        recentFailures: overview.recent_failures || [],
+        faults: overview.faults || {},
+        sourceErrors: errors,
+      });
+    } catch (e) {
+      console.error('[Operations Center] Error:', e);
+      sendJSON(res, { error: e.message || '读取运营状态失败' }, 502);
     }
   }
 
@@ -1456,73 +1998,27 @@ module.exports = function createMachinesHandlers(deps) {
 
       let closed = false;
       let fastBusy = false;
-      let slowBusy = false;
-      let coreR = null, versionR = null, stateR = null, sensorsR = null;
-      let edge = null;
-
-      const loadEdge = async () => {
-        try {
-          const presence = await loadEdgePresence();
-          const ep = presence && presence[machineNumber];
-          if (!ep) return;
-          edge = _edgeInfoFromPresence(ep);
-        } catch { }
-      };
-
-      const fetchSlow = async () => {
-        if (slowBusy) return;
-        slowBusy = true;
-        try {
-          const [c, v, s, sn] = await Promise.allSettled([
-            _fetchCollectorJSON(`http://${ip}:5025/api/core/health`, 6000),
-            _fetchCollectorJSON(`http://${ip}:5006/version`, 4000),
-            _fetchCollectorJSON(`http://${ip}:5006/state`, 4000),
-            _fetchCollectorJSON(`http://${ip}:5006/sensors`, 4000),
-          ]);
-          coreR = c; versionR = v; stateR = s; sensorsR = sn;
-        } catch { }
-        slowBusy = false;
-      };
 
       const tick = async () => {
         if (closed || fastBusy) return;
         fastBusy = true;
         try {
-          let healthR, coreRUse = coreR, edgeUse = edge;
-          const live = getEdgeLive ? getEdgeLive(machineNumber) : null;
-          if (live && live.core && live.hermesHealth && Date.now() - live.ts < 8000) {
-            healthR = { status: 'fulfilled', value: live.hermesHealth };
-            coreRUse = { status: 'fulfilled', value: live.core };
-            edgeUse = {
-              devicesNet: _mergeWujiDevices(live.devices || null, live.wuji || null)
-                || ((edge && edge.devicesNet) || null),
-              questInfo: live.quest ? {
-                netConnected: !!live.quest.connected,
-                serialNumber: live.quest.serialNumber || null,
-                adbStatus: live.quest.adbStatus || null,
-                batteryLevel: typeof live.quest.battery === 'object' && live.quest.battery
-                  ? (live.quest.battery.level != null ? live.quest.battery.level : null)
-                  : (typeof live.quest.battery === 'number' ? live.quest.battery : null),
-                batteryStatus: typeof live.quest.battery === 'object' && live.quest.battery ? (live.quest.battery.status || null) : null,
-                controllers: live.quest.controllers || null,
-              } : ((edge && edge.questInfo) || null),
-              cameraFps: live.cameraFps || (edge && edge.cameraFps) || null,
-              camerasFps: live.cameraFps && Array.isArray(live.cameraFps.cameras)
-                ? live.cameraFps.cameras
-                : ((live.cameras && Array.isArray(live.cameras)) ? live.cameras : ((edge && edge.cameras) || [])),
-              cameras: live.cameras && Array.isArray(live.cameras)
-                ? live.cameras
-                : ((edge && edge.cameras) || []),
-              encoderFps: live.encoderFps || (edge && edge.encoderFps) || null,
-              wuji: live.wuji || (edge && edge.wuji) || null,
-              handStream: live.handStream || (edge && edge.handStream) || null,
-            };
-          } else {
-            healthR = (await Promise.allSettled([
-              _fetchCollectorJSON(`http://${ip}:5006/health`, 3000),
-            ]))[0];
+          const presence = await loadAgentPresence();
+          const snap = presence[machineNumber];
+          if (!snap || !snap.hostOnline) {
+            if (!closed) res.write(`data: ${JSON.stringify({ success: false, machineNumber, hostOnline: false, source: 'agent' })}\n\n`);
+            fastBusy = false;
+            return;
           }
-          const body = _composeLiveInfo(machineNumber, [coreRUse, healthR, versionR, stateR, sensorsR], edgeUse);
+          const hermes = snap.hermes || {};
+          const fulfilled = value => ({ status: 'fulfilled', value });
+          const body = _composeLiveInfo(machineNumber, [
+            fulfilled(snap.importer || {}), fulfilled(hermes.health || {}),
+            fulfilled(hermes.version || {}), fulfilled(hermes.state || {}), fulfilled(hermes.sensors || {}),
+          ], _edgeInfoFromPresence(snap));
+          body.source = 'agent';
+          body.dataAgeSec = snap.hostLastSeen
+            ? Math.max(0, Math.round((Date.now() - new Date(snap.hostLastSeen).getTime()) / 1000)) : null;
           if (!closed) res.write(`data: ${JSON.stringify(body)}\n\n`);
         } catch { }
         fastBusy = false;
@@ -1531,19 +2027,15 @@ module.exports = function createMachinesHandlers(deps) {
       const kill = () => {
         if (closed) return;
         closed = true;
-        clearInterval(slowTimer);
         clearInterval(fastTimer);
         clearTimeout(maxTimer);
         try { res.end(); } catch { }
       };
       req.on('close', kill);
 
-      const slowTimer = setInterval(() => { loadEdge(); fetchSlow(); }, 10000);
       const fastTimer = setInterval(() => { tick(); }, 2000);
       const maxTimer = setTimeout(kill, 30 * 60 * 1000);
 
-      await loadEdge();
-      await fetchSlow();
       if (!closed) await tick();
     } catch (e) {
       console.error('[Machine Live] Error:', e);
@@ -1552,20 +2044,24 @@ module.exports = function createMachinesHandlers(deps) {
   }
 
   return {
+    handleListAgentHosts,
     handleGetMachineCode,
     handleMobileGetMachines,
     handleGetMachineStatus,
     handleGetMachineInfo,
+    handleGetOperationsCenter,
     handleGetMachineLive,
     handleStopCollector,
     handleStopExodus,
     handleFixQuest,
+    handleQuestControl,
     handleDiagnoseHands,
     handleDiagnoseProgress,
     handleMachineConfig,
+    handleMachineProbe,
     handleMachineCommands,
     handleMachineCommand,
-    // handleArmControl,  // 机械臂状态切换暂未启用
+    handleArmControl,
     handleGetMachines,
     handleAddMachine,
     handleDeleteMachine,
@@ -1575,6 +2071,8 @@ module.exports = function createMachinesHandlers(deps) {
     handleSyncMachineState,
     handleSetProductionStatus,
     handleGetProductionHistory,
+    handleGetStatusTimeline,
+    recordStatusInterval,
     setProductionStatus,
   };
 };
