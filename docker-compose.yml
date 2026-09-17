@@ -118,6 +118,8 @@ services:
       DB_USER: Wuzhenyu
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD required (set in .env)}
       DB_NAME: gms
+      GALIO_DB_HOST: ${GALIO_DB_HOST:-galio-postgres}
+      GALIO_DB_PORT: ${GALIO_DB_PORT:-5432}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       EDGE_TOKEN: ${EDGE_TOKEN:?EDGE_TOKEN required for machine agents}

@@ -7,6 +7,11 @@ frp/
 Sout/
 .env
 *.log
+*.bak*
+*.backup*
+*.orig
+__pycache__/
+*.py[cod]
 .DS_Store
 Thumbs.db
 cloudbaserc.json

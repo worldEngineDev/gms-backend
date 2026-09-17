@@ -1,5 +1,5 @@
 # Machine Heartbeat Agent - Lightweight Docker Container
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
@@ -9,10 +9,16 @@ WORKDIR /app
 # - v4l-utils：v4l2-ctl，用于摄像头设备检测（Linux）
 # - ffmpeg：用于摄像头帧率监控
 # - python3：灵巧手诊断脚本运行（wuji-sdk 从宿主机挂载，因为 SDK wheel 是 glibc only）
-RUN apk add --no-cache gcompat docker-cli v4l-utils ffmpeg wget unzip python3 py3-pip \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends docker.io v4l-utils ffmpeg wget unzip python3 python3-pip iputils-ping ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
     && wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O /tmp/pt.zip \
     && unzip -q /tmp/pt.zip -d /opt && rm /tmp/pt.zip \
     && ln -sf /opt/platform-tools/adb /usr/local/bin/adb
+
+# Wuji 官方 Python SDK：设备扫描、连接状态、手套/灵巧手 SN 和实时数据流。
+# 安装在 Agent 自身镜像中，避免依赖 importer 容器中的临时环境。
+RUN python3 -m pip install --no-cache-dir --break-system-packages wuji-sdk
 
 # npm 依赖：ws（WebSocket 实时推送通道）
 COPY package.json ./

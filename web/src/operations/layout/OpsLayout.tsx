@@ -10,7 +10,7 @@ import {
 } from '@ant-design/icons';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { useAuthStore, isAdmin, isSuperAdmin } from '@common/stores/auth';
+import { useAuthStore, isOperationsAdmin, isSuperAdmin } from '@common/stores/auth';
 import { useUIStore } from '@common/stores/ui';
 import * as api from '@common/api';
 
@@ -23,7 +23,7 @@ const NAV_GROUPS: NavGroup[] = [
   {
     key: 'overview', icon: '总', label: '总览',
     items: [
-      { key: '/', icon: 'P', label: '个人分析与个人数据' },
+      { key: '/', icon: 'P', label: '机器状态中心', adminOnly: true },
       { key: '/tasks', icon: 'T', label: '任务列表' },
       { key: '/analysis', icon: 'D', label: '数据分析' },
     ],
@@ -58,7 +58,7 @@ const NAV_GROUPS: NavGroup[] = [
 ];
 
 const TITLE_MAP: Record<string, string> = {
-  '/': '个人分析与个人数据',
+  '/': '机器状态中心',
   '/tasks': '任务列表',
   '/analysis': '数据分析',
   '/team': '组员',
@@ -115,8 +115,15 @@ export function OpsLayout() {
     return () => clearInterval(id);
   }, []);
 
-  const isLeader = isAdmin(user);
+  const isLeader = isOperationsAdmin(user);
   const isPlainUser = user?.role === 'user';
+  const isMachineStatusCenter = location.pathname === '/' || location.pathname === '/machine-status';
+
+  useEffect(() => {
+    if (user && isMachineStatusCenter && !isLeader) {
+      navigate('/tech-support/submit', { replace: true });
+    }
+  }, [user, isMachineStatusCenter, isLeader, navigate]);
 
   // 可见分组与全局搜索过滤
   const visibleGroups = useMemo(() => {
@@ -160,7 +167,8 @@ export function OpsLayout() {
     setPwdLoading(false);
   };
 
-  const pageAllowed = !isPlainUser || USER_ALLOWED.includes(location.pathname);
+  const pageAllowed = (!isMachineStatusCenter || isLeader)
+    && (!isPlainUser || USER_ALLOWED.includes(location.pathname));
   const isOverwatchHome = location.pathname === '/';
 
   return (

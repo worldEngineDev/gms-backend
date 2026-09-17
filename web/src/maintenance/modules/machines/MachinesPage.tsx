@@ -91,14 +91,18 @@ export default function MachinesPage() {
     }
     const hermesOk = hermes?.reachable !== false;
     const importerOk = importer?.reachable !== false;
-    const degraded = hermes?.health?.degraded || [];
+    const degraded = (hermes?.health?.degraded || []).filter((key: string) =>
+      key !== 'calibration/camera_pairing'
+      && key !== 'gello/wuji_glove_l'
+      && key !== 'gello/wuji_glove_r'
+    );
     const recording = hermes?.state?.isRecording === true;
     const stale = importer?.machineConfigStale || importer?.taskStale
       || hermes?.healthStale || hermes?.stateStale;
     if (!hermesOk || !importerOk) {
       return { color: 'red', icon: <DisconnectOutlined />, text: '采集服务异常' };
     }
-    if ((!hermes?.healthStale && (degraded.length || hermes?.health?.allConnected === false))
+    if ((!hermes?.healthStale && degraded.length)
       || (!hermes?.stateStale && hermes?.state?.emergencyStopped === true)) {
       return { color: 'orange', icon: <WarningOutlined />, text: '采集组件降级' };
     }
@@ -411,7 +415,9 @@ export default function MachinesPage() {
                     <div style={{ opacity: 0.6 }}>异常</div>
                     {(() => {
                       const alerts = detailMachine.edgeAlerts || [];
-                      const degraded = detailMachine.hermes?.health?.degraded || [];
+                      const degraded = (detailMachine.hermes?.health?.degraded || []).filter((key: string) =>
+                        key !== 'calibration/camera_pairing' && key !== 'gello/wuji_glove_l' && key !== 'gello/wuji_glove_r'
+                      );
                       const errors = detailMachine.hermes?.state?.errors || [];
                       if (!alerts.length && !degraded.length && !errors.length) return <span style={{ color: '#22c55e' }}>无</span>;
                       return <Space direction="vertical" size={2} style={{ width: '100%' }}>

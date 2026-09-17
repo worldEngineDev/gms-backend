@@ -118,3 +118,5 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 export const isAdmin = (user?: User | null): boolean =>
   !!user && (user.role === 'admin' || user.role === 'superadmin');
 export const isSuperAdmin = (user?: User | null): boolean => !!user && user.role === 'superadmin';
+export const isOperationsAdmin = (user?: User | null): boolean =>
+  !!user && (user.role === 'superadmin' || (user.system === 'operations' && user.role === 'admin'));

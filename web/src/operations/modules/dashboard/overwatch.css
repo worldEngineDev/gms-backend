@@ -49,6 +49,7 @@
 }
 .ow-counts button:hover, .ow-counts button.active { border-color:#4d769b; color:#e7f0f8; background:#193149; }
 .ow-counts button i { width:6px; height:6px; border-radius:50%; }
+.ow-counts .ow-collectable-filter i { background:#41d68a; box-shadow:0 0 7px rgba(65,214,138,.7); }
 .ow-counts button b { min-width:19px; padding:1px 5px; border-radius:9px; color:#d5e0e9; background:#23384d; font-size:10px; text-align:center; }
 .ow-filters .ant-select { width:150px; }
 .ow-filters .ant-input-affix-wrapper { width:min(280px,22vw); }
@@ -83,6 +84,9 @@
 .ow-card-top strong { overflow:hidden; color:#f0f5fa; font:700 15px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
 .ow-status-stack { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
 .ow-production-status { color:#9fc5e5; font-size:10px; font-weight:700; white-space:nowrap; }
+.ow-production-status.is-ready { color:#5ee39b; }
+.ow-production-status.is-standby { color:#f0b45b; }
+.ow-production-status.is-blocked { color:#df8f95; }
 .ow-status { display:flex; align-items:center; gap:5px; flex:0 0 auto; color:var(--ow-status); font-size:10px; font-weight:700; }
 .ow-status i { width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 7px currentColor; }
 .ow-card-task { margin-top:16px; overflow:hidden; color:#b9c8d6; font-size:13px; line-height:1.3; text-overflow:ellipsis; white-space:nowrap; }
@@ -97,6 +101,8 @@
 @media(max-width:1500px) { .ow-grid { grid-template-columns:repeat(4,minmax(0,1fr)); } }
 @media(max-width:1150px) { .ow-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
 .ow-card-problem { margin-top:7px; overflow:hidden; color:#ff8c92; font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
+.ow-card-blocked { margin-top:7px; overflow:hidden; color:#c99a72; font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
+.ow-card-standby { margin-top:7px; overflow:hidden; color:#d4a85f; font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
 .ow-loading { min-height:240px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; color:#748ba0; }
 
 .ow-detail-mask { position:fixed; inset:0; z-index:1000; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(2,7,12,.58); backdrop-filter:blur(3px); animation:ow-fade .18s ease; }

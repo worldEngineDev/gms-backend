@@ -1,17 +1,131 @@
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
 const os = require('os');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const GloveSNDetector = require('./glove-sn-detector');
 const DeviceStatusDetector = require('./device-detector');
 const CameraMonitor = require('./camera-monitor');
 const { CollectorApiPoller } = require('./collector-api');
+const { executeImporterAction } = require('./importer-actions');
 const {
   createContainerResolver,
   isAllowedManagedContainerName,
   safeContainerName,
 } = require('./container-resolver');
 
-const AGENT_VERSION = '1.3.6';
+const AGENT_VERSION = '1.5.1';
+
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
+const performance = {
+  heartbeat: { attempts: 0, successes: 0, failures: 0, lastLatencyMs: null, averageLatencyMs: null, lastSuccessAt: null },
+  collectorPoll: { attempts: 0, successes: 0, failures: 0, lastLatencyMs: null, averageLatencyMs: null, lastSuccessAt: null },
+};
+
+const HOST_METRICS_MIN_INTERVAL_MS = 5000;
+let previousCpuTimes = null;
+let cachedHostMetrics = null;
+let hostMetricsSampledAt = 0;
+
+function readCpuTimes() {
+  return os.cpus().reduce((total, cpu) => {
+    const times = cpu.times || {};
+    const idle = Number(times.idle) || 0;
+    const all = Object.values(times).reduce((sum, value) => sum + (Number(value) || 0), 0);
+    total.idle += idle;
+    total.all += all;
+    return total;
+  }, { idle: 0, all: 0 });
+}
+
+function toRatio(value) {
+  return Number.isFinite(value) ? Math.round(value * 10000) / 10000 : null;
+}
+
+function hostMetricsSnapshot() {
+  const now = Date.now();
+  if (cachedHostMetrics && now - hostMetricsSampledAt < HOST_METRICS_MIN_INTERVAL_MS) {
+    return { ...cachedHostMetrics };
+  }
+
+  const cpu = readCpuTimes();
+  let cpuUsedRatio = null;
+  if (previousCpuTimes) {
+    const totalDelta = cpu.all - previousCpuTimes.all;
+    const idleDelta = cpu.idle - previousCpuTimes.idle;
+    if (totalDelta > 0) cpuUsedRatio = toRatio(Math.max(0, Math.min(1, (totalDelta - idleDelta) / totalDelta)));
+  }
+  previousCpuTimes = cpu;
+
+  const memoryTotalBytes = os.totalmem();
+  const memoryAvailableBytes = os.freemem();
+  let diskTotalBytes = null;
+  let diskAvailableBytes = null;
+  let diskUsedRatio = null;
+  try {
+    const stat = fs.statfsSync('/');
+    diskTotalBytes = Number(stat.blocks) * Number(stat.bsize);
+    diskAvailableBytes = Number(stat.bavail) * Number(stat.bsize);
+    if (Number.isFinite(diskTotalBytes) && diskTotalBytes > 0 && Number.isFinite(diskAvailableBytes)) {
+      diskUsedRatio = toRatio(Math.max(0, Math.min(1, 1 - diskAvailableBytes / diskTotalBytes)));
+    }
+  } catch (error) {
+    // 磁盘指标不可读不影响心跳与其余硬件检测。
+  }
+
+  cachedHostMetrics = {
+    checkedAt: new Date(now).toISOString(),
+    cpuUsedRatio,
+    load1: Number(os.loadavg()[0].toFixed(2)),
+    memoryUsedRatio: memoryTotalBytes > 0 ? toRatio(1 - memoryAvailableBytes / memoryTotalBytes) : null,
+    memoryTotalBytes,
+    memoryAvailableBytes,
+    diskUsedRatio,
+    diskTotalBytes,
+    diskAvailableBytes,
+  };
+  hostMetricsSampledAt = now;
+  return { ...cachedHostMetrics };
+}
+
+function recordPerformanceMetric(metric, ok, startedAt) {
+  const target = performance[metric];
+  if (!target) return;
+  const latency = Math.max(0, Date.now() - startedAt);
+  target.attempts += 1;
+  if (ok) {
+    target.successes += 1;
+    target.lastSuccessAt = new Date().toISOString();
+  } else {
+    target.failures += 1;
+  }
+  target.lastLatencyMs = latency;
+  // 指数移动平均，避免在 Agent 内无限保存历史样本。
+  target.averageLatencyMs = target.averageLatencyMs == null
+    ? latency
+    : Math.round(target.averageLatencyMs * 0.8 + latency * 0.2);
+}
+
+function performanceSnapshot() {
+  const memory = process.memoryUsage();
+  const lag = eventLoopDelay.mean / 1e6;
+  return {
+    agent: {
+      uptimeSecs: Math.round(process.uptime()),
+      nodeVersion: process.version,
+      memory: {
+        rssBytes: memory.rss,
+        heapUsedBytes: memory.heapUsed,
+        heapTotalBytes: memory.heapTotal,
+      },
+      eventLoopLagMs: Number.isFinite(lag) ? Math.round(lag * 100) / 100 : null,
+    },
+    host: hostMetricsSnapshot(),
+    heartbeat: { ...performance.heartbeat },
+    collectorPoll: { ...performance.collectorPoll },
+  };
+}
 
 const CONFIG = {
   backendUrl: process.env.GMS_BACKEND_URL || 'http://10.5.51.216:8765',
@@ -20,7 +134,10 @@ const CONFIG = {
   importerUrl: process.env.IMPORTER_API_URL || process.env.IMPORTER_URL || 'http://127.0.0.1:5025',
   hermesUrl: process.env.HERMES_API_URL || process.env.HERMES_URL || 'http://127.0.0.1:5006',
   heartbeatInterval: parseInt(process.env.HEARTBEAT_INTERVAL || '30', 10) * 1000,
-  deviceScanInterval: 120 * 1000,
+  // 设备连接状态需要比 30s 心跳更快更新；Importer/Hermes 仍由独立轮询负责。
+  deviceScanInterval: Math.max(5000, parseInt(process.env.DEVICE_SCAN_INTERVAL || '15', 10) * 1000),
+  // Wuji SDK 连接/数据流诊断较重，和轻量网络探测分开执行。
+  wujiScanInterval: Math.max(15000, parseInt(process.env.WUJI_SCAN_INTERVAL || '60', 10) * 1000),
   snRescanInterval: 10 * 60 * 1000,
   retryInterval: 10 * 1000,
   timeout: 8000,
@@ -51,12 +168,16 @@ const machineInfo = {
   handStream: null,
   importer: null,
   hermes: null,
+  containers: [],
+  containerRoles: {},
+  containerRoleStatus: {},
 };
 
 let deviceDetector = null;
 let snDetector = null;
 let cameraMonitor = null;
 let wujiScanPromise = null;
+let deviceScanPromise = null;
 
 function detectMachineNumber() {
   if (CONFIG.machineNumber) {
@@ -149,7 +270,7 @@ function httpRequest(url, options = {}) {
 }
 
 const collectorApi = new CollectorApiPoller({
-  importerUrl: CONFIG.importerUrl,
+      importerUrl: CONFIG.importerUrl,
   hermesUrl: CONFIG.hermesUrl,
   timeout: CONFIG.collectorTimeout,
   request: httpRequest,
@@ -163,17 +284,20 @@ async function pollCollectorApis(force = false) {
   const now = Date.now();
   if (!force && collectorPollAt && now - collectorPollAt < FAST_COLLECTOR_INTERVAL) return;
   if (collectorPollPromise) return collectorPollPromise;
+  const startedAt = Date.now();
   collectorPollPromise = collectorApi.poll()
     .then(snapshot => {
       machineInfo.importer = snapshot.importer;
       machineInfo.hermes = snapshot.hermes;
       collectorPollAt = Date.now();
+      recordPerformanceMetric('collectorPoll', true, startedAt);
       return snapshot;
     })
     .catch(error => {
 
       console.error('[Collector] API 轮询异常:', error.message);
       collectorPollAt = Date.now();
+      recordPerformanceMetric('collectorPoll', false, startedAt);
       return null;
     })
     .finally(() => { collectorPollPromise = null; });
@@ -197,6 +321,55 @@ const containerResolver = createContainerResolver({
   logger: console,
   execAsync: _execAsync,
 });
+
+// 容器角色是 Agent 在本机通过 Docker inspect 得到的结果。它不依赖
+// Importer/Hermes API，避免某个 API 短暂不可达时把「容器状态」显示为空。
+const CONTAINER_STATUS_MIN_INTERVAL_MS = 8000;
+let containerStatusSampledAt = 0;
+let containerStatusPromise = null;
+
+async function refreshContainerRoleStatus(force = false) {
+  const now = Date.now();
+  if (!force && containerStatusSampledAt && now - containerStatusSampledAt < CONTAINER_STATUS_MIN_INTERVAL_MS) {
+    return machineInfo.containerRoleStatus;
+  }
+  if (containerStatusPromise) return containerStatusPromise;
+
+  containerStatusPromise = (async () => {
+    const roles = ['importer', 'collector', 'exodus'];
+    const resolved = await Promise.all(roles.map(async role => {
+      const name = await resolveContainer(role);
+      const inspected = name ? await containerResolver.inspectContainer(name) : null;
+      return { role, name, inspected };
+    }));
+    const containerRoles = {};
+    const containerRoleStatus = {};
+    const containers = [];
+    for (const { role, name, inspected } of resolved) {
+      if (!name) continue;
+      const status = {
+        name,
+        running: !!(inspected && inspected.running),
+        image: (inspected && inspected.image) || '',
+        checkedAt: new Date(now).toISOString(),
+      };
+      containerRoles[role] = name;
+      containerRoleStatus[role] = status;
+      containers.push({ name, role, status: status.running ? 'running' : 'exited', image: status.image });
+    }
+    machineInfo.containerRoles = containerRoles;
+    machineInfo.containerRoleStatus = containerRoleStatus;
+    machineInfo.containers = containers;
+    containerStatusSampledAt = now;
+    return containerRoleStatus;
+  })();
+
+  try {
+    return await containerStatusPromise;
+  } finally {
+    containerStatusPromise = null;
+  }
+}
 
 async function resolveContainer(role, options = {}) {
   return containerResolver.resolve(role, options);
@@ -498,37 +671,66 @@ async function scanHandStream() {
     console.error('[HandStream] 日志提取失败:', e.message);
   }
 }
-
 function buildPayload() {
   const summary = machineInfo.devices;
   const valueConnected = (value) => {
     if (value && typeof value === 'object') return value.connected === true;
     return !!value;
   };
+
+  // 计算设备数据年龄（秒）
+  const calculateAge = (checkedAt) => {
+    if (!checkedAt) return null;
+    try {
+      const age = Math.floor((Date.now() - new Date(checkedAt).getTime()) / 1000);
+      return age >= 0 ? age : null;
+    } catch {
+      return null;
+    }
+  };
+
   const glovePayload = (side, fallbackIp) => {
     const base = summary && summary.gloves ? summary.gloves[side] : null;
     const sdk = machineInfo.wuji && machineInfo.wuji.gloves ? machineInfo.wuji.gloves[side] : null;
+    const connected = (sdk && sdk.connected === true) || valueConnected(base);
+    const snCode = (sdk && sdk.sn) || (base && typeof base === 'object' && base.snCode) || machineInfo.gloves[side].snCode || null;
+    const checkedAt = (base && base.checkedAt) || (summary && summary.checkedAt) || null;
+    const ageS = calculateAge(checkedAt);
+
     return {
       ...(base && typeof base === 'object' ? base : {}),
       ...(sdk || {}),
-      connected: (sdk && sdk.connected === true) || valueConnected(base),
-      snCode: (sdk && sdk.sn) || (base && typeof base === 'object' && base.snCode) || machineInfo.gloves[side].snCode || null,
+      connected,
+      snCode,
       ip: (sdk && sdk.ip) || (base && typeof base === 'object' && base.ip) || fallbackIp,
+      everSeen: connected && snCode ? true : (connected ? false : null),
+      ageS: connected ? ageS : null,
+      status: connected ? 'connected' : 'disconnected',
     };
   };
+
   const handPayload = (side, fallbackIp) => {
     const base = summary && summary.dexterousHands ? summary.dexterousHands[side] : null;
     const sdk = machineInfo.wuji && machineInfo.wuji.dexterousHands
       ? machineInfo.wuji.dexterousHands[side] : null;
+    const connected = (sdk && sdk.connected === true) || valueConnected(base);
+    const snCode = (sdk && sdk.sn) || (base && typeof base === 'object' && base.snCode)
+        || (machineInfo.handsSN && machineInfo.handsSN[side]) || null;
+    const checkedAt = (base && base.checkedAt) || (summary && summary.checkedAt) || null;
+    const ageS = calculateAge(checkedAt);
+
     return {
       ...(base && typeof base === 'object' ? base : {}),
       ...(sdk || {}),
-      connected: (sdk && sdk.connected === true) || valueConnected(base),
-      snCode: (sdk && sdk.sn) || (base && typeof base === 'object' && base.snCode)
-        || (machineInfo.handsSN && machineInfo.handsSN[side]) || null,
+      connected,
+      snCode,
       ip: (sdk && sdk.ip) || (base && typeof base === 'object' && base.ip) || fallbackIp,
+      everSeen: connected && snCode ? true : (connected ? false : null),
+      ageS: connected ? ageS : null,
+      status: connected ? 'connected' : 'disconnected',
     };
   };
+
   return {
     machineNumber: machineInfo.machineNumber,
     hostname: machineInfo.hostname,
@@ -543,7 +745,9 @@ function buildPayload() {
       totalMemory: os.totalmem(),
       freeMemory: os.freemem(),
     },
+    performance: performanceSnapshot(),
     machineType: (summary && summary.machineType) || null,
+    deviceSnapshotAt: (summary && summary.checkedAt) || null,
     cameraFps: machineInfo.cameraFps || machineInfo.encoderFps || null,
     encoderFps: machineInfo.encoderFps || null,
     cameras: machineInfo.cameras || [],
@@ -559,7 +763,18 @@ function buildPayload() {
         right: handPayload('right', '192.168.1.111'),
       } : null,
       roboticArm: summary && summary.roboticArm ? {
-        connected: !!summary.roboticArm.connected, ip: '192.168.1.190',
+        connected: !!summary.roboticArm.connected,
+        networkConnected: summary.roboticArm.networkConnected !== false && !!summary.roboticArm.connected,
+        controlConnected: !!summary.roboticArm.controlConnected,
+        ip: summary.roboticArm.ip || '192.168.1.190',
+        port: summary.roboticArm.port || 30003,
+        latency: summary.roboticArm.latency || null,
+        controlLatency: summary.roboticArm.controlLatency || null,
+        networkError: summary.roboticArm.networkError || null,
+        controlError: summary.roboticArm.controlError || null,
+        status: summary.roboticArm.connected ? 'connected' : 'disconnected',
+        everSeen: summary.roboticArm.connected ? true : null,
+        ageS: summary.roboticArm.connected ? calculateAge(summary.checkedAt) : null,
       } : null,
     },
     quest: summary && summary.quest ? {
@@ -568,14 +783,20 @@ function buildPayload() {
       adbStatus: summary.quest.error || (summary.quest.connected ? 'device' : null),
       battery: summary.quest.battery ?? null,
       controllers: summary.questControllers || null,
+      status: summary.quest.connected ? 'connected' : 'disconnected',
+      everSeen: summary.quest.connected && summary.quest.serialNumber ? true : (summary.quest.connected ? false : null),
+      ageS: summary.quest.connected ? calculateAge(summary.checkedAt) : null,
     } : null,
     importer: machineInfo.importer,
     hermes: machineInfo.hermes,
+    containers: machineInfo.containers || [],
+    containerRoles: machineInfo.containerRoles || {},
+    containerRoleStatus: machineInfo.containerRoleStatus || {},
   };
 }
 
 // ==================== WebSocket 实时推送 ====================
-const WS_PUSH_INTERVAL = parseInt(process.env.WS_PUSH_INTERVAL || '2', 10) * 1000;
+const WS_PUSH_INTERVAL = Math.max(10000, parseInt(process.env.WS_PUSH_INTERVAL || '10', 10) * 1000);
 
 function _httpGetJSON(url, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -645,8 +866,10 @@ async function sendHeartbeat() {
     console.error('[Heartbeat] ❌ 机器编号未设置，跳过心跳');
     return false;
   }
+  const startedAt = Date.now();
   try {
     await pollCollectorApis();
+    await refreshContainerRoleStatus();
     await scanEncoderFps();
     await scanHandStream();
     const payload = buildPayload();
@@ -663,6 +886,7 @@ async function sendHeartbeat() {
     } else {
       console.log(`[Heartbeat] ✅ ${machineInfo.machineNumber} 心跳成功`);
     }
+    recordPerformanceMetric('heartbeat', true, startedAt);
     return true;
   } catch (error) {
     if (error.statusCode === 401 || error.statusCode === 403) {
@@ -670,6 +894,7 @@ async function sendHeartbeat() {
     } else {
       console.error(`[Heartbeat] ❌ 心跳发送失败: ${error.message}`);
     }
+    recordPerformanceMetric('heartbeat', false, startedAt);
     return false;
   }
 }
@@ -693,18 +918,23 @@ function heartbeatLoop() {
 }
 
 async function scanDevices() {
-  try {
-    await deviceDetector.detectAll();
-    machineInfo.devices = deviceDetector.getDeviceSummary();
-    await scanWujiHands();
-  } catch (e) {
-    console.error('[Device] 设备探测异常:', e.message);
-  }
+  if (deviceScanPromise) return deviceScanPromise;
+  deviceScanPromise = (async () => {
+    try {
+      // 轻量探测每 15 秒更新一次；不要把 40 秒级 Wuji SDK 扫描串在这里，
+      // 否则一台设备的 SDK 超时会拖慢所有设备的实时状态。
+      await deviceDetector.detectAll();
+      machineInfo.devices = deviceDetector.getDeviceSummary();
+    } catch (e) {
+      console.error('[Device] 设备探测异常:', e.message);
+    }
+  })().finally(() => { deviceScanPromise = null; });
+  return deviceScanPromise;
 }
 
 async function scanWujiDevicesOnce() {
   const importerContainer = await resolveContainer('importer');
-  if (!importerContainer) {
+  if (!importerContainer && process.env.WUJI_SDK_IN_AGENT === '0') {
     machineInfo.wuji.error = 'importer 容器未运行';
     machineInfo.wuji.scannedAt = new Date().toISOString();
     console.warn('[Wuji SDK] 未找到运行中的 importer 容器，跳过扫描');
@@ -816,13 +1046,22 @@ print(json.dumps(rows, ensure_ascii=False))`;
   const fs = require('fs');
   try {
     fs.writeFileSync(tmp, script);
-    const { stdout: scanStdout } = await execDockerFilesForRole(
-      'importer',
-      '上传并执行 Wuji SDK 扫描',
-      [{ local: tmp, remote }],
-      (name) => `docker exec ${name} /usr/bin/timeout -k 5s 40s /usr/local/bin/python3 ${remote}`,
-      { timeout: 50000, maxBuffer: 2 * 1024 * 1024 },
-    );
+    let scanStdout;
+    if (process.env.WUJI_SDK_IN_AGENT !== '0') {
+      // SDK 已安装在 heartbeat-agent 自身镜像中时，直接扫描本机网络/设备。
+      ({ stdout: scanStdout } = await _execAsync(
+        `PYTHON_BIN=$(command -v python3 || command -v python || true); test -n "$PYTHON_BIN"; /usr/bin/timeout -k 5s 40s "$PYTHON_BIN" ${tmp}`,
+        { timeout: 50000, maxBuffer: 2 * 1024 * 1024 },
+      ));
+    } else {
+      ({ stdout: scanStdout } = await execDockerFilesForRole(
+        'importer',
+        '上传并执行 Wuji SDK 扫描',
+        [{ local: tmp, remote }],
+        (name) => `docker exec ${name} sh -c 'PYTHON_BIN=$(command -v python3 || command -v python); /usr/bin/timeout -k 5s 40s "$PYTHON_BIN" ${remote}'`,
+        { timeout: 50000, maxBuffer: 2 * 1024 * 1024 },
+      ));
+    }
     const r = { stdout: scanStdout };
     const rows = JSON.parse((r.stdout || '').trim().split('\n').pop() || '[]');
     if (!Array.isArray(rows) || !rows.length) {
@@ -951,12 +1190,16 @@ const healthServer = http.createServer((req, res) => {
       machineNumber: machineInfo.machineNumber,
       uptime: process.uptime(),
       consecutiveFailures,
+      performance: performanceSnapshot(),
       gloves: machineInfo.gloves,
       wuji: machineInfo.wuji,
       devices: machineInfo.devices,
       cameraFps: machineInfo.cameraFps || machineInfo.encoderFps || null,
       cameras: machineInfo.cameras || [],
       handStream: machineInfo.handStream || null,
+      containers: machineInfo.containers || [],
+      containerRoles: machineInfo.containerRoles || {},
+      containerRoleStatus: machineInfo.containerRoleStatus || {},
       importer: machineInfo.importer ? {
         reachable: machineInfo.importer.reachable,
         checkedAt: machineInfo.importer.checkedAt,
@@ -971,6 +1214,37 @@ const healthServer = http.createServer((req, res) => {
   } else if (req.url === '/info') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(buildPayload()));
+  } else if (req.method === 'POST' && req.url === '/importer-action') {
+    const token = req.headers['x-edge-token'] || '';
+    if (!CONFIG.edgeToken || token !== CONFIG.edgeToken) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    let raw = '';
+    req.on('data', chunk => {
+      raw += chunk;
+      if (raw.length > 65536) req.destroy();
+    });
+    req.on('end', async () => {
+      try {
+        const body = JSON.parse(raw || '{}');
+        const action = String(body.action || '');
+        console.log(`[ImporterAction] 开始执行: ${action}`);
+        const output = await executeImporterAction({
+          actionKey: action,
+          input: body.payload,
+          importerUrl: CONFIG.importerUrl,
+        });
+        console.log(`[ImporterAction] 执行完成: ${action}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, executionChannel: 'agent-importer-api', ...output }));
+      } catch (e) {
+        console.error(`[ImporterAction] 执行失败: ${e.message}`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, executionChannel: 'agent-importer-api', error: e.message }));
+      }
+    });
   } else if (req.method === 'POST' && req.url && req.url.startsWith('/stop-collector')) {
     req.resume();
     const armToken = req.headers['x-edge-token'] || '';
@@ -1807,7 +2081,9 @@ async function main() {
   });
   await scanDevices();
   setInterval(scanDevices, CONFIG.deviceScanInterval);
-  setTimeout(() => scanWujiHands().catch(() => {}), 15000);
+  // Wuji SDK 诊断单独按较慢周期运行；设备在线/离线以轻量探测实时补齐。
+  setTimeout(() => scanWujiHands().catch(() => {}), 5000);
+  setInterval(() => scanWujiHands().catch(() => {}), CONFIG.wujiScanInterval);
   await startCameraMonitoring();
 
   console.log('------------------------------------------');

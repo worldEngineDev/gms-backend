@@ -14,7 +14,7 @@ services:
       # 机器编号（留空则从 hostname we-xxx 自动检测）
       # - MACHINE_NUMBER=we-100
       # 心跳间隔（秒）
-      - HEARTBEAT_INTERVAL=30
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-30}
       # 采集机本地只读 API（host 网络下 127.0.0.1 指向宿主机）
       - IMPORTER_API_URL=${IMPORTER_API_URL:-http://127.0.0.1:5025}
       - HERMES_API_URL=${HERMES_API_URL:-http://127.0.0.1:5006}
@@ -23,9 +23,13 @@ services:
       - CAMERA_EXPECTED_FPS=${CAMERA_EXPECTED_FPS:-30}
       - CAMERA_FPS_THRESHOLD=${CAMERA_FPS_THRESHOLD:-0.8}
       - CAMERA_SAMPLE_FRAMES=${CAMERA_SAMPLE_FRAMES:-30}
+      # Wuji SDK 安装在 Agent 镜像内，直接扫描本机设备；设为 0 可回退到 importer 容器执行。
+      - WUJI_SDK_IN_AGENT=${WUJI_SDK_IN_AGENT:-1}
+      - IMPORTER_SINK_PATH=/var/importer_sink
     volumes:
       # SN 识别方式1：WUJI 标定目录（只读）
       - /var/.rdc2:/var/.rdc2:ro
+      - /var/importer_sink:/var/importer_sink:ro
       # SN 识别方式2：读取采集器容器 importer-staging 的 /exchange/machine.jsonc
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # 直接采样 V4L2 摄像头帧率

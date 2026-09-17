@@ -1,4 +1,6 @@
 'use strict';
+const fs = require('fs');
+const path = require('path');
 
 function joinUrl(base, path) {
   return `${String(base || '').replace(/\/+$/, '')}${path}`;
@@ -18,6 +20,109 @@ function boolOrNull(value) {
 
 function errorMessage(error) {
   return String(error && error.message ? error.message : error || '请求失败').slice(0, 240);
+}
+
+function readLocalQualityReports(root = process.env.IMPORTER_SINK_PATH || '/var/importer_sink', since = Date.now() / 1000 - 86400, operatorId = null) {
+  const result = { pass: 0, fail: 0, error: 0, total: 0, source: 'importer-quality-reports' };
+  try {
+    for (const name of fs.readdirSync(root)) {
+      const file = path.join(root, name, 'quality_report.json');
+      let stat;
+      try { stat = fs.statSync(file); } catch { continue; }
+      if (stat.mtimeMs / 1000 < since) continue;
+      try {
+        const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (operatorId) {
+          let task;
+          try { task = JSON.parse(fs.readFileSync(path.join(root, name, 'task.jsonc'), 'utf8')); } catch { task = null; }
+          if (!task || String(task.operator_id || '') !== String(operatorId)) continue;
+        }
+        result.total += 1;
+        if (report.is_good === true) result.pass += 1;
+        else if (report.is_good === false) result.fail += 1;
+        else result.error += 1;
+      } catch { result.error += 1; }
+    }
+  } catch {}
+  result.rate = result.total ? result.pass / result.total : null;
+  return result;
+}
+
+function latestLocalOperator(root = process.env.IMPORTER_SINK_PATH || '/var/importer_sink') {
+  let best = null;
+  try {
+    for (const name of fs.readdirSync(root)) {
+      const taskFile = path.join(root, name, 'task.jsonc');
+      try {
+        const stat = fs.statSync(taskFile);
+        const task = JSON.parse(fs.readFileSync(taskFile, 'utf8'));
+        if (task.operator_id && (!best || stat.mtimeMs > best.mtimeMs)) best = { id: String(task.operator_id), mtimeMs: stat.mtimeMs };
+      } catch {}
+    }
+  } catch {}
+  return best?.id || null;
+}
+
+function timestampOf(item) {
+  const value = item && (item.occurred_at ?? item.updated_at ?? item.created_at ?? item.timestamp);
+  const n = Number(value);
+  return Number.isFinite(n) ? (n > 1e12 ? n / 1000 : n) : NaN;
+}
+
+function scopeToOperator(overview, operatorId, episodes = []) {
+  const source = overview && typeof overview === 'object' ? overview : {};
+  if (!operatorId || !Array.isArray(source.sessions)) return { overview: source, episodeCount: null, quality: null };
+  const sessions = source.sessions.filter(s => String(s.operator_id || '') === String(operatorId));
+  const windows = sessions.map(s => {
+    const start = Number(s.started_at);
+    const end = s.ended_at == null ? Date.now() / 1000 : Number(s.ended_at);
+    return Number.isFinite(start) ? [start, Number.isFinite(end) ? end : Date.now() / 1000] : null;
+  }).filter(Boolean);
+  const belongs = item => {
+    const ts = timestampOf(item);
+    return Number.isFinite(ts) && windows.some(([start, end]) => ts >= start && ts <= end);
+  };
+  const accountEpisodes = Array.isArray(episodes) ? episodes.filter(belongs) : [];
+  const failures = Array.isArray(source.quality_failures) ? source.quality_failures.filter(belongs) : [];
+  const reports = Array.isArray(source.recent_mcap_reports) ? source.recent_mcap_reports.filter(belongs) : [];
+  const count = accountEpisodes.length;
+  const fail = failures.length;
+  const quality = count > 0 ? { pass: Math.max(0, count - fail), fail, error: 0, total: count, rate: Math.max(0, count - fail) / count, source: 'account-session' } : { pass: 0, fail: 0, error: 0, total: 0, rate: null, source: 'account-session' };
+  return {
+    overview: { ...source, sessions, attended_seconds: accountWorkdaySecondsCompat(sessions, 0), quality_failures: failures, recent_mcap_reports: reports, quality },
+    episodeCount: count,
+    quality,
+  };
+}
+
+function accountWorkdaySecondsCompat(items, fallback = null) {
+  if (!Array.isArray(items) || !items.length) return fallback;
+  const sessions = items.map(s => ({ start: Number(s.started_at), end: s.ended_at == null ? Date.now() / 1000 : Number(s.ended_at) }))
+    .filter(s => Number.isFinite(s.start)).sort((a, b) => a.start - b.start);
+  let total = 0; let previousEnd = null;
+  for (const s of sessions) {
+    if (previousEnd != null && s.start - previousEnd >= 5 * 3600) total = 0;
+    total += Math.max(0, s.end - s.start);
+    previousEnd = Math.max(previousEnd || 0, s.end);
+  }
+  return Math.round(total);
+}
+
+function countLocalEpisodes(root = process.env.IMPORTER_SINK_PATH || '/var/importer_sink', since = Date.now() / 1000 - 86400, operatorId = null) {
+  let count = 0;
+  try {
+    for (const name of fs.readdirSync(root)) {
+      const dir = path.join(root, name);
+      try {
+        const task = JSON.parse(fs.readFileSync(path.join(dir, 'task.jsonc'), 'utf8'));
+        if (operatorId && String(task.operator_id || '') !== String(operatorId)) continue;
+        const meta = JSON.parse(fs.readFileSync(path.join(dir, 'metadata.json'), 'utf8'));
+        const ts = Number(meta.collect_time_unix || 0);
+        if (!ts || ts >= since) count += 1;
+      } catch {}
+    }
+  } catch {}
+  return count;
 }
 
 function normalizeImporterMachine(config) {
@@ -226,18 +331,22 @@ class CollectorApiPoller {
   async pollImporter() {
     const checkedAt = new Date().toISOString();
     const previous = this.snapshot.importer || {};
+    // Importer 自带状态页默认展示最近 24 小时；保持相同统计口径，避免
+    // 中心和机器本机的通过/判废数量不一致。
+    const until = Date.now() / 1000;
+    const since = until - 86400;
     const names = ['machine', 'task', 'health', 'workers', 'queue', 'processing', 'processor', 'episodes', 'recentEpisodes', 'overview'];
     const settled = await Promise.allSettled([
       this.requestImporter('/api/config/machine'),
       this.requestImporter('/api/config/task'),
       this.requestImporter(['/api/maintenance/health', '/api/core/health']),
-      this.requestImporter('/api/data/processing/workers/status'),
-      this.requestImporter('/api/data/processing/process_queue/status'),
-      this.requestImporter(['/api/data/processing/overview', '/api/data/processing/overall']),
+      this.requestImporter(['/api/data/processing/workers/status', '/api/processor/workers/status']),
+      this.requestImporter(['/api/data/processing/process_queue/status', '/api/processor/process_queue/status']),
+      this.requestImporter(['/api/data/processing/overview', '/api/data/processing/overall', '/api/processor/workflows/status']),
       this.requestImporter('/api/processor/overview'),
-      this.requestImporter('/api/data/episodes/records'),
+      this.requestImporter(['/api/data/episodes/records', '/api/processor/episodes/recent']),
       this.requestImporter('/api/processor/episodes/recent'),
-      this.requestImporter('/api/operations/overview'),
+      this.requestImporter(`/api/operations/overview?since=${since}&until=${until}`),
     ]);
     const results = Object.fromEntries(names.map((name, index) => [name, settled[index]]));
     const machineResult = results.machine;
@@ -280,14 +389,42 @@ class CollectorApiPoller {
       next.importerVersion = stringOrNull(core.version);
       next.channel = stringOrNull(core.channel);
       next.activity = stringOrNull(core.activity);
-      next.collectorAlive = boolOrNull(core.is_collector_alive);
+      // Some Importer builds briefly report a false flag while the collector
+      // is restarting even though collector_info and its containers are live.
+      // Prefer the explicit flag, but use those stronger signals as fallback.
+      const containersLive = core.containers && Object.values(core.containers).some(value => String(value).toLowerCase() === 'running');
+      const collectorInfoLive = core.collector_info && core.collector_info.ok === true;
+      next.collectorAlive = core.is_collector_alive === true || collectorInfoLive || containersLive
+        ? true : core.is_collector_alive === false ? false : (previous.collectorAlive ?? null);
       next.observerAlive = boolOrNull(core.is_observer_alive);
       next.loggedIn = boolOrNull(core.is_logged_in);
       next.idleTimeSecs = numberOrNull(core.idle_time_secs);
     }
-    const overview = next.overview && typeof next.overview === 'object' ? next.overview : {};
-    next.quality = overview.quality && typeof overview.quality === 'object' ? overview.quality : null;
-    next.qualityPassRate = numberOrNull(overview.quality_pass_rate);
+    let overview = next.overview && typeof next.overview === 'object' ? next.overview : {};
+    // When Importer is logged out, retain the last account represented in the
+    // local episode metadata so historical counts continue to follow the account.
+    const activeOperatorId = next.task?.operator?.id || latestLocalOperator();
+    const episodePayload = next.episodes && typeof next.episodes === 'object' ? next.episodes : [];
+    const episodeItems = Array.isArray(episodePayload) ? episodePayload : (Array.isArray(episodePayload.items) ? episodePayload.items : []);
+    const scoped = scopeToOperator(overview, activeOperatorId, episodeItems);
+    if (scoped.episodeCount != null) {
+      overview = scoped.overview;
+      next.overview = overview;
+      next.accountEpisodeCount = scoped.episodeCount;
+      next.accountQuality = scoped.quality;
+    }
+    const localQuality = readLocalQualityReports(process.env.IMPORTER_SINK_PATH, since, activeOperatorId);
+    next.accountOperatorId = activeOperatorId;
+    if (localQuality.total > 0) {
+      next.quality = localQuality;
+      next.qualityPassRate = localQuality.rate;
+    } else if (next.accountQuality) {
+      next.quality = next.accountQuality;
+      next.qualityPassRate = next.accountQuality.rate;
+    } else {
+      next.quality = overview.quality && typeof overview.quality === 'object' ? overview.quality : null;
+      next.qualityPassRate = numberOrNull(overview.quality_pass_rate);
+    }
     next.latestMcapReport = overview.latest_mcap_report || null;
     next.recentMcapReports = Array.isArray(overview.recent_mcap_reports) ? overview.recent_mcap_reports : [];
     next.recentFailures = Array.isArray(overview.recent_failures) ? overview.recent_failures : [];

@@ -770,11 +770,22 @@
       if (!wrap) return;
       if (!silent) wrap.innerHTML = '<div class="m-loading">加载中...</div>';
       try {
+        var currentRole = (this.currentUser || {}).role;
+        var canViewMachineCenter = currentRole === 'admin' || currentRole === 'superadmin';
         var pendingTickets = API.getTechSupportList().catch(function(){ return []; });
-        var pendingMachines = API.getMachines().catch(function(){ return []; });
+        var pendingMachines = canViewMachineCenter ? API.getMachines().catch(function(){ return []; }) : Promise.resolve([]);
+        var pendingImporterLive = canViewMachineCenter ? API.getMachineStatusCenterLive().catch(function(){ return null; }) : Promise.resolve(null);
         var tickets = (await pendingTickets)||[];
         var machines = (await pendingMachines)||[];
-        this._setOpsMachines(machines);
+        var importerLive = await pendingImporterLive;
+        if (canViewMachineCenter) {
+          this._setOpsMachines(machines);
+          if (importerLive && importerLive.success) this._mergeOpsImporterLive(importerLive);
+          if (this._opsImporterTimer) clearInterval(this._opsImporterTimer);
+          this._opsImporterTimer = setInterval(function() {
+            if (M.currentTab === 'home' && !document.hidden) M._refreshOpsImporterLive();
+          }, 10000);
+        }
         var my = tickets.filter(function(t){
           var user = M.currentUser || {};
           return (t.submitterId && (t.submitterId === user.id || t.submitterId === user.userId)) ||
@@ -786,7 +797,7 @@
         var replacements = []; try { replacements = await API.getReplacements(); } catch(e){}
         var inReplacement = replacements.filter(function(r){return r.status==='in_replacement';}).length;
         wrap.innerHTML =
-          '<section class="m-live-panel" id="m-ops-live-panel">'+this._renderOpsMachinePanel()+'</section>'+
+          (canViewMachineCenter ? '<section class="m-live-panel" id="m-ops-live-panel">'+this._renderOpsMachinePanel()+'</section>' : '')+
           '<div class="m-stat-grid">'+
             S.stat('总技术支持',tickets.length)+S.stat('待响应',pend.length)+
             S.stat('我的技术支持',my.length)+S.stat('今日提交',today)+
@@ -820,7 +831,29 @@
       if (!this._opsMachineLimit) this._opsMachineLimit = 120;
     },
 
+    _mergeOpsImporterLive(payload) {
+      var machines = payload && payload.machines ? payload.machines : {};
+      if (!this._opsMachineMap) this._opsMachineMap = Object.create(null);
+      Object.keys(machines).forEach(function(num) {
+        M._opsMachineMap[num] = Object.assign({}, M._opsMachineMap[num] || { machineNumber:num }, {
+          importerLive: machines[num],
+        });
+      });
+      this._opsImporterFetchedAt = payload && payload.fetchedAt;
+    },
+
+    async _refreshOpsImporterLive() {
+      try {
+        var result = await API.getMachineStatusCenterLive();
+        if (result && result.success) this._mergeOpsImporterLive(result);
+        var panel = document.getElementById('m-ops-live-panel');
+        if (panel) panel.innerHTML = this._renderOpsMachinePanel();
+      } catch (e) { }
+    },
+
     _applyOpsMachineLive(update) {
+      var role = (this.currentUser || {}).role;
+      if (_isOps && role !== 'admin' && role !== 'superadmin') return;
       if (!update || !update.machineNumber) return;
       if (!this._opsMachineMap) this._opsMachineMap = Object.create(null);
       if (!this._opsLiveQueue) this._opsLiveQueue = Object.create(null);
@@ -849,6 +882,12 @@
 
     _opsMachineStatus(machine) {
       if (!machine || machine.hostOnline === false) return 'offline';
+      var importerLive = machine.importerLive || null;
+      if (importerLive && importerLive.reachable) {
+        if (importerLive.recording || importerLive.controlState === 'RECORD') return 'recording';
+        if (importerLive.collectorRunning && Array.isArray(importerLive.blockers) && importerLive.blockers.length) return 'error';
+        return 'online_idle';
+      }
       if (machine.collectorStarted === false
         || (machine.edgeContainerRoleStatus && machine.edgeContainerRoleStatus.collector && machine.edgeContainerRoleStatus.collector.running === false)
         || (machine.containerRoleStatus && machine.containerRoleStatus.collector && machine.containerRoleStatus.collector.running === false)) return 'online_idle';
@@ -889,6 +928,13 @@
       if (panel) panel.innerHTML = this._renderOpsMachinePanel();
     },
 
+    _opsMachineSetAvailabilityFilter(value) {
+      this._opsMachineAvailabilityFilter = value || 'all';
+      this._opsMachineLimit = 120;
+      var panel = document.getElementById('m-ops-live-panel');
+      if (panel) panel.innerHTML = this._renderOpsMachinePanel();
+    },
+
     _opsMachineSearch(value) {
       this._opsMachineQuery = value || '';
       this._opsMachineLimit = 120;
@@ -905,6 +951,8 @@
     },
 
     _renderOpsMachinePanel() {
+      var role = (this.currentUser || {}).role;
+      if (_isOps && role !== 'admin' && role !== 'superadmin') return '';
       var self = this;
       var STATUS = {
         recording: { label: '运行中', color: '#16a34a', icon: '●' },
@@ -923,12 +971,17 @@
       all.forEach(function(m){ counts[m._liveStatus]++; });
       var filter = this._opsMachineFilter || 'all';
       var typeFilter = this._opsMachineTypeFilter || 'all';
+      var availabilityFilter = this._opsMachineAvailabilityFilter || 'all';
       var query = String(this._opsMachineQuery || '').trim().toLowerCase();
       var filtered = all.filter(function(m){
         if (filter !== 'all' && m._liveStatus !== filter) return false;
         var machineType = m.machineType === 'glove_only' || m.deviceType === 'glove' ? 'glove_only'
           : (m.machineType === 'dexterous' || m.deviceType === 'dexterous') ? 'dexterous' : 'other';
         if (typeFilter !== 'all' && machineType !== typeFilter) return false;
+        var il = m.importerLive || {};
+        var collectible = il.reachable === true && il.canCollect === true && m.hostOnline !== false && m.productionStatus !== 'waiting_repair';
+        if (availabilityFilter === 'collectible' && !collectible) return false;
+        if (availabilityFilter === 'unavailable' && collectible) return false;
         if (!query) return true;
         var task = m.task || (m.importer && m.importer.task) || {};
         var operator = task.operator || {};
@@ -943,6 +996,8 @@
       var card = function(m) {
         var meta = STATUS[m._liveStatus];
         var task = m.task || (m.importer && m.importer.task) || null;
+        var live = m.importerLive || null;
+        if (live && live.task) task = live.task;
         var operator = task && task.operator ? task.operator : null;
         var prodStatus = m._liveStatus === 'recording' ? 'in_production' : (m.productionStatus || 'ready');
         var prod = {
@@ -952,17 +1007,27 @@
           : (m.machineType === 'dexterous' || m.deviceType === 'dexterous') ? '灵巧手' : '';
         var taskName = task && (task.name || task.taskName);
         var operatorName = operator && (operator.name || operator.displayName || operator.username);
-        var details = [taskName ? '任务 '+self._esc(taskName) : '暂无任务', operatorName ? '操作员 '+self._esc(operatorName) : '', type, prod].filter(Boolean);
+        var collectible = !!(live && live.reachable && live.canCollect && m.hostOnline !== false && prodStatus !== 'waiting_repair');
+        var availability = live && live.reachable
+          ? (collectible ? '<span style="color:#16a34a;font-weight:700;">可采集</span>' : '<span style="color:#dc2626;font-weight:700;">不可采集</span>')
+          : '<span style="color:#7d8da0;">状态未知</span>';
+        var queueText = live && live.queue ? '队列 '+Number(live.queue.busy||0)+'/'+Number(live.queue.pending||0) : '';
+        var qualityText = live && live.latestQuality && live.latestQuality.status ? '质检 '+live.latestQuality.status : '';
+        var collectorText = live && live.reachable ? (live.collectorRunning ? '采集器运行' : '采集器待机') : '';
+        var details = [taskName ? '任务 '+self._esc(taskName) : '暂无任务', operatorName ? '操作员 '+self._esc(operatorName) : '', type, prod, collectorText, queueText, qualityText].filter(Boolean);
         var alertText = '';
         if (m._liveStatus === 'error') {
           var alerts = m.edgeAlerts || m.alerts || [];
           var first = Array.isArray(alerts) ? alerts.find(function(a){ return !self._isSNAdvisory(a); }) : null;
-          alertText = first && first.message ? '<div class="m-live-card-alert">'+self._esc(first.message)+'</div>'
-            : '<div class="m-live-card-alert">设备或采集程序异常</div>';
+          var blocker = live && Array.isArray(live.blockers) ? live.blockers[0] : null;
+          alertText = blocker ? '<div class="m-live-card-alert">阻断项：'+self._esc(blocker.id)+(blocker.reason?' · '+self._esc(blocker.reason):'')+'</div>'
+            : first && first.message ? '<div class="m-live-card-alert">'+self._esc(first.message)+'</div>'
+              : '<div class="m-live-card-alert">设备或采集程序异常</div>';
         }
+        if (!alertText && live && live.availabilityReason) alertText = '<div style="font-size:11px;color:#7d8da0;margin-top:5px;">'+self._esc(live.availabilityReason)+'</div>';
         return '<button class="m-live-card m-live-'+m._liveStatus+'" onclick="M._msShowCollectorInfo(\''+self._esc(m.machineNumber)+'\')">'+
           '<div class="m-live-card-head"><span class="m-live-machine">'+self._esc(m.machineNumber)+'</span>'+ 
-          '<span class="m-live-state-stack"><span class="m-live-production">'+prod+'</span><span class="m-live-state" style="color:'+meta.color+'"><i>'+meta.icon+'</i>'+meta.label+'</span></span></div>'+ 
+          '<span class="m-live-state-stack"><span class="m-live-production">'+availability+'</span><span class="m-live-state" style="color:'+meta.color+'"><i>'+meta.icon+'</i>'+meta.label+'</span></span></div>'+
           '<div class="m-live-card-meta">'+details.join('<span>·</span>')+'</div>'+alertText+'</button>';
       };
       var groups = order.map(function(status){
@@ -979,12 +1044,17 @@
       var typeChip = function(key, label) {
         return '<button class="m-live-chip'+(typeFilter===key?' active':'')+'" onclick="M._opsMachineSetTypeFilter(\''+key+'\')">'+label+'</button>';
       };
+      var availabilityChip = function(key, label) {
+        return '<button class="m-live-chip'+(availabilityFilter===key?' active':'')+'" onclick="M._opsMachineSetAvailabilityFilter(\''+key+'\')">'+label+'</button>';
+      };
+      var collectibleCount = all.filter(function(m){var x=m.importerLive||{};return x.reachable&&x.canCollect&&m.hostOnline!==false&&m.productionStatus!=='waiting_repair';}).length;
       return '<div class="m-live-head"><div><div class="m-live-title">机器实时状态</div>'+
-        '<div class="m-live-sub"><span class="m-live-pulse"></span> 实时连接 · 状态变化约 2 秒更新</div></div>'+
+        '<div class="m-live-sub"><span class="m-live-pulse"></span> Agent 实时连接 · Importer API 每 10 秒更新</div></div>'+
         '<button class="m-live-open" onclick="M.showAdminSubPage(\'machine-status\')">完整状态</button></div>'+
         '<div class="m-live-summary">'+chip('all','全部',all.length)+chip('recording','运行',counts.recording)+
           chip('online_idle','空闲',counts.online_idle)+chip('error','异常',counts.error)+chip('offline','离线',counts.offline)+'</div>'+
         '<div class="m-live-summary m-live-type-summary">'+typeChip('all','全部类型')+typeChip('dexterous','灵巧手')+typeChip('glove_only','纯手套')+'</div>'+
+        '<div class="m-live-summary m-live-type-summary">'+availabilityChip('all','全部可用性')+availabilityChip('collectible','可采集 '+collectibleCount)+availabilityChip('unavailable','不可采集/未知 '+(all.length-collectibleCount))+'</div>'+
         '<div class="m-live-search-wrap"><input id="m-live-search" class="m-live-search" placeholder="搜索机器、任务或操作员" value="'+self._esc(this._opsMachineQuery || '')+'" oninput="M._opsMachineSearch(this.value)"></div>'+
         '<div class="m-live-groups">'+groups+'</div>'+
         (filtered.length > shown.length ? '<button class="m-live-more" onclick="M._opsMachineMore()">继续显示（还有 '+(filtered.length-shown.length)+' 台）</button>' : '');
@@ -1119,7 +1189,7 @@
         {label:'库位',page:'storage-locations',desc:'库位管理与设备分配',icon:'K',sys:'mnt'},
         {label:'库存配置',page:'inventory-config',desc:'动态添加和管理物品库存',icon:'K',a:true,sys:'mnt'},
         {label:'机器管理',page:'machines',desc:'机器上线/下线与手套绑定',icon:'🖥',sys:'mnt'},
-        {label:'机器状态',page:'machine-status',desc:'生产状态可视化与变更',icon:'📈',sys:'both'},
+        {label:'机器状态',page:'machine-status',desc:'生产状态可视化与变更',icon:'📈',sys:'both',opsAdmin:true},
         {label:'SN链接',page:'sn-links',desc:'SN状态查询链接管理',icon:'🔗',sys:'mnt'},
         {label:'机器链接',page:'machine-links',desc:'机器状态查询链接管理',icon:'🧭',sys:'mnt'},
         {label:'设备配置',page:'equipment-config',desc:'设备类型与消耗配置',icon:'🔧',a:true,sys:'mnt'},
@@ -1130,6 +1200,8 @@
 
         if (_isOps) { if (i.sys !== 'ops' && i.sys !== 'both') return false; }
         else { if (i.sys !== 'mnt' && i.sys !== 'both') return false; }
+
+        if (_isOps && i.opsAdmin && role !== 'admin' && role !== 'superadmin') return false;
 
         if (!i.a || role === 'admin' || role === 'superadmin') return true;
         return false;
@@ -1144,6 +1216,10 @@
 
       var _ADMIN_ONLY = {audit:1,settings:1,users:1,popup:1,sop:1,solutions:1,replacement:1,'inventory-config':1,'equipment-config':1,'delivery-notes':1,'server-status':1};
       var _role = (this.currentUser||{}).role;
+      if (_isOps && page === 'machine-status' && _role !== 'admin' && _role !== 'superadmin') {
+        this.toast('仅运营管理员可查看机器状态中心', 'err');
+        return;
+      }
       if (_ADMIN_ONLY[page] && _role !== 'admin' && _role !== 'superadmin') {
         this.toast('无权限访问该功能', 'err');
         return;
@@ -3865,8 +3941,9 @@
 
     async _renderMachineStatusPage(wrap) {
       var self = this;
-      var machines = [], eqcfg = [], history = [];
+      var machines = [], eqcfg = [], history = [], importerLive = null;
       try { machines = (await API.getMachines()) || []; } catch(e) {}
+      try { importerLive = await API.getMachineStatusCenterLive(); } catch(e) {}
       try { eqcfg = (await API.getEquipmentConfig()) || []; } catch(e) {}
       try { history = (await API.getProductionHistory()) || []; } catch(e) {}
 
@@ -3878,6 +3955,12 @@
           latestMap[num] = m;
         }
       });
+      if (importerLive && importerLive.machines) {
+        Object.keys(importerLive.machines).forEach(function(num) {
+          if (!latestMap[num]) latestMap[num] = { machineNumber:num };
+          latestMap[num].importerLive = importerLive.machines[num];
+        });
+      }
       var numbers = Object.keys(latestMap).sort();
 
       var typeLabel = {};
@@ -3908,6 +3991,7 @@
       this._msData = { latestMap:latestMap, numbers:numbers, history:history, PS_META:PS_META, PS_ORDER:PS_ORDER, dtLabel:dtLabel, dtOptions:dtOptions, effectiveDeviceType:effectiveDeviceType };
 
       if (this._msProdFilter === undefined) this._msProdFilter = 'all';
+      if (this._msAvailabilityFilter === undefined) this._msAvailabilityFilter = 'all';
       if (this._msDeviceType === undefined) this._msDeviceType = 'all';
       if (this._msSearch === undefined) this._msSearch = '';
       var dtSelOpts = dtOptions.map(function(o){
@@ -3917,6 +4001,7 @@
         '<div class="m-section-title">生产状态可视化：可生产 / 在生产 / 待维修 / 在测试（待维修由维修工单自动驱动）</div>'+
         '<div id="m-ms-stats"></div>'+
         '<div id="m-ms-prodtabs" style="margin:8px 0;"></div>'+
+        '<div id="m-ms-availtabs" style="margin:8px 0;"></div>'+
         '<div style="display:flex;gap:8px;margin-bottom:8px;">'+
           '<select class="m-select" style="flex:1;" onchange="M._msSetDt(this.value)">'+dtSelOpts+'</select>'+
           '<input class="m-input" style="flex:1;" placeholder="搜索机器编号..." value="'+this._esc(this._msSearch)+'" oninput="M._msSetSearch(this.value)">'+
@@ -3928,14 +4013,41 @@
       this._msRenderStats();
       this._msRenderList();
       this._msRenderHistory();
+      if (this._msStatusCenterTimer) clearInterval(this._msStatusCenterTimer);
+      this._msStatusCenterTimer = setInterval(function() {
+        if (!document.getElementById('m-ms-list')) {
+          clearInterval(M._msStatusCenterTimer);
+          M._msStatusCenterTimer = null;
+          return;
+        }
+        if (!document.hidden) M._msRefreshImporterLive();
+      }, 10000);
+    },
+    async _msRefreshImporterLive() {
+      var D = this._msData;
+      if (!D || !document.getElementById('m-ms-list')) return;
+      try {
+        var response = await API.getMachineStatusCenterLive();
+        if (!response || !response.success || !response.machines) return;
+        Object.keys(response.machines).forEach(function(num) {
+          if (!D.latestMap[num]) D.latestMap[num] = { machineNumber:num };
+          D.latestMap[num].importerLive = response.machines[num];
+          if (D.numbers.indexOf(num) < 0) D.numbers.push(num);
+        });
+        D.numbers.sort();
+        this._msRenderStats();
+        this._msRenderList();
+      } catch (e) { }
     },
     _msSetProd(v) { this._msProdFilter = v; this._msRenderList(); },
+    _msSetAvailability(v) { this._msAvailabilityFilter = v; this._msRenderStats(); this._msRenderList(); },
     _msSetDt(v) { this._msDeviceType = v; this._msRenderStats(); this._msRenderList(); },
     _msSetSearch(v) { this._msSearch = v; this._msRenderList(); },
     _msDeviceFiltered() {
       var D = this._msData;
       if (this._msDeviceType === 'all') return D.numbers.slice();
-      return D.numbers.filter(function(n){ return D.effectiveDeviceType(D.latestMap[n]) === self._msDeviceType; });
+      var selectedType = this._msDeviceType;
+      return D.numbers.filter(function(n){ return D.effectiveDeviceType(D.latestMap[n]) === selectedType; });
     },
     _msRenderStats() {
       var self = this;
@@ -3949,17 +4061,30 @@
 
       var counts = { ready:0, in_production:0, waiting_repair:0, testing:0 };
       filtered.forEach(function(n){ var ps = (D.latestMap[n].productionStatus)||'ready'; counts[ps] = (counts[ps]||0)+1; });
+      var collectibleCount = filtered.filter(function(n){
+        var rec=D.latestMap[n], live=rec.importerLive||{};
+        return live.reachable&&live.canCollect&&rec.hostOnline!==false&&rec.productionStatus!=='waiting_repair';
+      }).length;
       var totalLabel = this._msDeviceType === 'all' ? '机器总数' : (D.dtLabel(this._msDeviceType)+' 数量');
 
       var statsBox = document.getElementById('m-ms-stats');
       if (statsBox) {
         statsBox.innerHTML = '<div class="m-stat-row" style="display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;">'+
           '<div class="m-stat-card" style="flex:0 0 auto;min-width:80px;"><div class="m-stat-value">'+filtered.length+'</div><div class="m-stat-label">'+self._esc(totalLabel)+'</div></div>'+
+          '<div class="m-stat-card" style="flex:0 0 auto;min-width:80px;"><div class="m-stat-value" style="color:#16a34a;">'+collectibleCount+'</div><div class="m-stat-label">可采集</div></div>'+
           PS_ORDER.map(function(s){
             var meta = PS_META[s];
             return '<div class="m-stat-card" style="flex:0 0 auto;min-width:80px;"><div class="m-stat-value" style="color:'+meta.c+';">'+(counts[s]||0)+'</div><div class="m-stat-label">'+meta.l+'</div></div>';
           }).join('')+
           '</div>';
+      }
+
+      var availBox = document.getElementById('m-ms-availtabs');
+      if (availBox) {
+        availBox.innerHTML = '<div class="m-sub-tabs" style="display:flex;flex-wrap:wrap;">'+
+          '<button class="m-sub-tab'+(this._msAvailabilityFilter==='all'?' active':'')+'" onclick="M._msSetAvailability(\'all\')">全部可用性</button>'+
+          '<button class="m-sub-tab'+(this._msAvailabilityFilter==='collectible'?' active':'')+'" onclick="M._msSetAvailability(\'collectible\')">可采集('+collectibleCount+')</button>'+
+          '<button class="m-sub-tab'+(this._msAvailabilityFilter==='unavailable'?' active':'')+'" onclick="M._msSetAvailability(\'unavailable\')">不可采集/未知('+(filtered.length-collectibleCount)+')</button></div>';
       }
 
       var tabsBox = document.getElementById('m-ms-prodtabs');
@@ -3980,6 +4105,11 @@
       var list = D.numbers.slice();
       if (this._msProdFilter !== 'all') list = list.filter(function(n){ return ((D.latestMap[n].productionStatus)||'ready') === self._msProdFilter; });
       if (this._msDeviceType !== 'all') list = list.filter(function(n){ return D.effectiveDeviceType(D.latestMap[n]) === self._msDeviceType; });
+      if (this._msAvailabilityFilter !== 'all') list = list.filter(function(n){
+        var rec=D.latestMap[n], live=rec.importerLive||{};
+        var ok=live.reachable&&live.canCollect&&rec.hostOnline!==false&&rec.productionStatus!=='waiting_repair';
+        return self._msAvailabilityFilter==='collectible' ? ok : !ok;
+      });
       var q = (this._msSearch||'').trim().toLowerCase();
       if (q) list = list.filter(function(n){ return n.toLowerCase().indexOf(q) >= 0; });
       if (!list.length) { box.innerHTML = '<div class="m-empty"><div class="m-empty-text">暂无符合条件的机器</div></div>'; return; }
@@ -3990,6 +4120,13 @@
         var reason = rec.productionReason ? '<div class="m-device-info" style="opacity:.7;font-size:12px;">原因：'+self._esc(rec.productionReason)+'</div>' : '';
         var updater = rec.productionUpdatedByName || (rec.productionSource==='ticket'?'工单联动':'-');
         var updTime = rec.productionUpdatedAt ? self._fmtTime(rec.productionUpdatedAt) : '-';
+        var live = rec.importerLive || {};
+        var collectible = !!(live.reachable && live.canCollect && rec.hostOnline !== false && psKey !== 'waiting_repair');
+        var liveLine = '<div class="m-device-info" style="font-size:12px;color:'+(collectible?'#16a34a':live.reachable?'#cf1322':'#8c8c8c')+';font-weight:600;">'+
+          (live.reachable ? (collectible?'可采集':'不可采集') : 'Importer 状态未知')+
+          (live.collectorRunning?' · 采集器运行':' · 采集器待机')+
+          (live.queue?' · 队列 '+Number(live.queue.busy||0)+'/'+Number(live.queue.pending||0):'')+'</div>'+
+          (live.availabilityReason?'<div class="m-device-info" style="font-size:11px;opacity:.7;">'+self._esc(live.availabilityReason)+'</div>':'');
 
         var switchBtn = '';
         if (psKey !== 'waiting_repair') {
@@ -4011,6 +4148,7 @@
           '<div class="m-device-header"><div class="m-device-name" style="font-family:monospace;">'+self._esc(num)+'</div>'+
             '<span style="display:inline-block;padding:1px 8px;border-radius:10px;background:'+meta.bg+';color:'+meta.c+';font-weight:600;">'+meta.l+'</span></div>'+
           '<div class="m-device-info">设备类型：'+self._esc(D.dtLabel(D.effectiveDeviceType(rec)))+'</div>'+ 
+          liveLine+
           reason+
           '<div class="m-device-info" style="font-size:12px;opacity:.7;">更新人：'+self._esc(updater)+' · '+updTime+'</div>'+
           '<div class="m-device-info" style="font-size:11px;color:#1677ff;">点击查看完整历史 →</div>'+
@@ -4062,18 +4200,38 @@
         return '<span style="color:#cf1322;">'+(d.status==='unknown'?'未知':'断开')+'</span>';
       };
       var camName = { ego_camera:'前置相机', wrist_left:'左手腕相机', wrist_right:'右手腕相机', vst_left:'头显左眼', vst_right:'头显右眼', overlay:'合成画面' };
-      var CS = { RECORD:['录制中','#cf1322'], ACTIVE:['就绪','#389e0d'], ALIGN:['对齐中','#d46b08'], INIT:['准备中','#d46b08'], BOOT:['启动中','#d46b08'], STOPPED:['已停止','#999'] };
+      var CS = { RECORD:['录制中','#cf1322'], ACTIVE:['就绪','#389e0d'], ALIGN:['对齐中','#d46b08'], INIT:['准备中','#d46b08'], BOOT:['启动中','#d46b08'], STOPPED:['已停止','#999'], ok:['控制正常','#389e0d'] };
       var cell = function(label, valHtml, detail) {
         return '<div style="flex:1 1 30%;min-width:120px;background:#f7f8fa;border-radius:8px;padding:7px 9px;">'+
           '<div style="font-size:11px;opacity:.55;margin-bottom:2px;">'+label+'</div>'+
           '<div style="font-size:13px;">'+valHtml+'</div>'+
           (detail?'<div style="font-size:11px;opacity:.65;margin-top:3px;">'+detail+'</div>':'')+'</div>';
       };
+      // “设备已连接”和“有人正在使用”是两个不同状态：
+      // 设备可被 Wuji SDK 探测到时仍可能没有登录账号、没有任务、没有录制。
+      // 用独立状态保存本次弹窗的使用结论，避免把在线硬件误显示成使用中。
+      var usageState = { inUse: false, label: '未使用' };
       var netTag = function(d) {
         if (!d || d.connected === undefined) return '<span style="opacity:.4;">无</span>';
         return d.connected ? '<span style="color:#1677ff;">网络在线</span>' : '<span style="opacity:.6;">未响应探测</span>';
       };
-      var tagFor = function(stream, net) { return stream ? devTag(stream) : netTag(net); };
+      // Agent/Wuji 的网络与数据流探测比 Hermes health 更接近设备真实状态。
+      // Hermes 可能保留“connected but no data”或旧的 disconnected 状态，
+      // 不能覆盖 Agent 刚刚确认的连接、数据帧和灵巧手关节结果。
+      var tagFor = function(stream, net) {
+        if (net && typeof net.connected === 'boolean') {
+          if (net.connected === false) return '<span style="color:#cf1322;">未连接</span>';
+          var connectedLabel = usageState.inUse ? '已连接' : '已连接·未使用';
+          if (net.healthy === true || net.dataStreamOk === true
+            || Number(net.onlineJoints || 0) > 0
+            || Number(net.tactileFrames || 0) > 0
+            || Number(net.emfPosesFrames || 0) > 0) {
+            return '<span style="color:#389e0d;">'+connectedLabel+'</span>';
+          }
+          return '<span style="color:#1677ff;">'+(usageState.inUse?'网络在线':'网络在线·未使用')+'</span>';
+        }
+        return stream ? devTag(stream) : netTag(net);
+      };
       var netOff = function(x){ return x && x.connected === false ? '<span style="opacity:.6;">未响应探测</span>' : ''; };
       var delayTxt = function(v){ return v!=null ? '延迟 '+Math.round(Number(v))+'ms' : ''; };
       var render = function(d, errMsg) {
@@ -4084,6 +4242,17 @@
           html = '<div class="m-empty"><div class="m-empty-text">'+self._esc((d && d.error) || '暂无数据')+'</div></div>';
         } else {
           var s = d.system || {}, dv = d.devices || {}, t = d.task;
+          var taskActive = !!(t && ['active','running','in_progress','recording'].indexOf(String(t.state || '').toLowerCase()) >= 0);
+          var taskFinished = !!(t && ['fulfilled','completed','finished','cancelled','canceled','failed'].indexOf(String(t.state || '').toLowerCase()) >= 0);
+          // system.errorCount 是控制状态里的计数，可能仍为 0；采集链路的
+          // health errors 才是相机、Quest、手套等当前实际错误。
+          var chainErrors = (Array.isArray(d.errors) ? d.errors : []).filter(function(e) {
+            return !e || !e.level || String(e.level).toLowerCase() === 'error' || String(e.level).toLowerCase() === 'critical';
+          });
+          var chainErrorCount = Math.max(Number(s.errorCount || 0), chainErrors.length);
+          // Importer 进程运行不等同于机器正在被使用；只有录制中或有活动任务才算使用中。
+          usageState.inUse = s.loggedIn === true && (s.isRecording === true || taskActive);
+          usageState.label = usageState.inUse ? '使用中' : (s.loggedIn === false ? '未使用' : (s.activity === 'running' ? '待机' : (s.activity === 'idle' ? '空闲' : '未使用')));
           // 机器类型由心跳代理的实际探针结果决定。纯手套机即使历史快照中
           // 还残留灵巧手/机械臂字段，也不在状态面板渲染这些设备。
           var isGloveOnlyMachine = d.machineType === 'glove_only'
@@ -4093,23 +4262,31 @@
           html += (d.partial && d.partial.hermesOffline ? '<div style="background:#fafafa;border:1px solid #f0f0f0;border-radius:8px;padding:6px 10px;font-size:12px;color:#8c8c8c;margin-bottom:6px;">采集程序未运行</div>' : '');
           html += (d.partial && d.partial.hermesFailed ? '<div style="background:#fff7e6;border-radius:8px;padding:6px 10px;font-size:12px;color:#d46b08;margin-bottom:6px;">采集程序(5006) 暂不可达</div>' : '');
           var stale = !!s.stateStale;
-          var cs = stale ? ['已停止', '#999'] : (CS[s.controlState] || [s.controlState || '未知', '#999']);
+          var collectorUnavailable = d.collectorStarted === false || s.collectorAlive === false || !!(d.partial && d.partial.hermesOffline);
+          var cs = collectorUnavailable ? ['采集程序未启动', '#999']
+            : (stale ? ['状态已过期', '#999'] : (CS[s.controlState] || [s.controlState || '状态未上报', '#999']));
           html += '<div class="m-form-section-title">系统程序</div>';
           html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">'+
             cell('机器类型', '<span style="font-weight:600;color:'+(isGloveOnlyMachine?'#666':'#1677ff')+';">'+(isGloveOnlyMachine?'纯手套机器':d.machineType==='dexterous'?'灵巧手机器':'未知')+'</span>')+
-            cell('系统程序', '<span style="color:'+(s.activity==='running'?'#389e0d':'#999')+';font-weight:600;">'+(s.activity==='running'?'运行中':(s.activity==='idle'?'空闲':(s.activity||'未知')))+'</span>')+
-            cell('工作阶段', '<span style="color:'+cs[1]+';font-weight:600;">'+cs[0]+'</span>'+(!stale&&s.isRecording?' <span style="color:#cf1322;">● 录制中</span>':'')+
+            cell('Importer', '<span style="color:'+(s.activity==='running'?'#389e0d':'#999')+';font-weight:600;">'+(s.activity==='running'?'运行中':(s.activity==='idle'?'空闲':(s.activity||'未知')))+'</span>',
+              collectorUnavailable ? '采集程序未启动' : (s.collectorAlive ? '采集链路可达' : '采集链路未启动或不可达'))+
+            cell('使用状态', '<span style="color:'+(usageState.inUse?'#389e0d':'#999')+';font-weight:600;">'+usageState.label+'</span>',
+              s.loggedIn === false ? 'Importer 未登录' : (taskActive ? '有进行中任务' : (taskFinished ? '最近任务已完成' : '无进行中任务')))+
+            cell('控制阶段', '<span style="color:'+cs[1]+';font-weight:600;">'+cs[0]+'</span>'+(!stale&&s.isRecording?' <span style="color:#cf1322;">● 录制中</span>':'')+
               (stale&&s.lastControlState?' <span style="font-size:11px;opacity:.65;">停止前: '+((CS[s.lastControlState]||[s.lastControlState])[0])+(s.lastIsRecording?'·录制中':'')+(s.lastStateAgeSec?('（'+Math.round(s.lastStateAgeSec/60)+' 分钟前）'):'')+'</span>':''))+
-            cell('程序版本', 'I '+(d.importerVersion||'-')+' / C '+(d.collectorVersion||'-'))+
-            cell('错误数', (s.errorCount||0)>0?'<span style="color:#cf1322;font-weight:600;">'+s.errorCount+'</span>':'<span style="color:#389e0d;">0</span>')+
-            cell('采集器', self._esc(d.collectorName||'-'))+
-            cell('主机编号', self._esc(d.computerId||'-'))+
+            cell('程序版本', 'I '+(d.importerVersion||'-')+' / C '+(d.collectorVersion||'未获取'))+
+            cell('采集链路错误', chainErrorCount>0?'<span style="color:#cf1322;font-weight:600;">'+chainErrorCount+'</span>':'<span style="color:#389e0d;">0</span>',
+              chainErrorCount>0 ? '相机、Quest、手套等采集链路错误' : '采集链路未报告错误')+
+            cell('采集器类型', self._esc(d.collectorType || (d.importer && d.importer.collectorType) || '-') ,
+              d.workflow || (d.importer && d.importer.workflow) ? 'Workflow: '+self._esc(d.workflow || d.importer.workflow) : '')+
+            cell('主机编号', self._esc(d.computerId||'-'),
+              d.machineId || d.collectorName ? 'Machine ID: '+self._esc(d.machineId || d.collectorName) : '')+
             '</div>';
-          html += '<div class="m-form-section-title">当前任务</div>';
+          html += '<div class="m-form-section-title">'+(taskActive ? '当前任务' : (taskFinished ? '最近任务' : '当前任务'))+'</div>';
           if (t) {
             var pct = t.percent || 0;
             html += '<div style="margin-bottom:6px;"><b>'+self._esc(t.name||'-')+'</b>'+(t.isTraining?' <span style="color:#722ed1;">[培训]</span>':'')+
-              ' <span style="opacity:.5;font-size:12px;">'+(t.state==='active'?'进行中':self._esc(t.state||''))+'</span></div>';
+              ' <span style="opacity:.5;font-size:12px;">'+(t.state==='active'?'进行中':(taskFinished?'已完成':self._esc(t.state||'')))+'</span></div>';
             html += '<div style="font-size:12px;opacity:.7;margin-bottom:4px;">采集员：'+self._esc((t.operator&&t.operator.name)||'未知')+(t.operator&&t.operator.level!=null?'（等级 '+t.operator.level+'）':'')+'</div>';
             html += '<div style="background:#f0f0f0;border-radius:6px;height:8px;overflow:hidden;"><div style="width:'+pct+'%;background:#1677ff;height:8px;"></div></div>';
             var hc = t.hoursCompleted!=null ? Number(t.hoursCompleted).toFixed(2) : '0';
@@ -4119,6 +4296,9 @@
             html += '<div style="opacity:.45;font-size:13px;margin-bottom:8px;">当前没有任务</div>';
           }
           html += '<div class="m-form-section-title" style="margin-top:10px;">设备状态</div>';
+          if (d.sources && d.sources.devices === 'unreachable') {
+            html += '<div style="background:#fff7e6;border-radius:8px;padding:6px 10px;font-size:12px;color:#d46b08;margin-bottom:6px;">设备探测 API 不可达，当前不展示手套、灵巧手、Quest 或机械臂连接结论。</div>';
+          }
           var qi = d.questInfo || null, dnet = d.devicesNet || null, wuji = d.wuji || null;
           var diagFor = function(kind, side) {
             var net = dnet && dnet[kind] && dnet[kind][side];
@@ -4166,12 +4346,27 @@
               if (g.tactileOk != null || g.emfPosesOk != null) {
                 parts.push('<span style="font-family:monospace;">触觉 '+(g.tactileOk?'✓':'×')+' · 姿态 '+(g.emfPosesOk?'✓':'×')+'</span>');
               }
-              if (g.dataStreamOk != null) parts.push('<span style="font-family:monospace;">数据流 '+(g.dataStreamOk?'✓':'×')+'</span>');
+              if (g.dataStreamOk != null) parts.push('<span style="font-family:monospace;">采集数据流 '+(g.dataStreamOk?'✓':'未就绪')+'</span>');
               if (g.tactileFrames != null || g.emfPosesFrames != null) {
-                parts.push('帧 '+(g.tactileFrames||0)+'/'+(g.emfPosesFrames||0));
+                parts.push('采集帧 '+(g.tactileFrames||0)+'/'+(g.emfPosesFrames||0));
               }
-              if (g.error) parts.push('<span style="color:#cf1322;">'+self._esc(g.error)+'</span>');
+              if (g.error) parts.push('<span style="color:#cf1322;">设备协议未响应：'+self._esc(g.error)+'</span>');
               return parts.join('　');
+            };
+            var roboticArmCell = function(){
+              var arm = (dnet && dnet.roboticArm) || dv.marvin || null;
+              if (!arm) return '';
+              var networkUp = arm.networkConnected === true || (arm.networkConnected == null && arm.connected === true);
+              var controlUp = arm.controlConnected === true;
+              var tag = !networkUp
+                ? '<span style="color:#cf1322;">网络不可达</span>'
+                : (controlUp ? '<span style="color:#389e0d;">网络在线·控制可用</span>' : '<span style="color:#d46b08;">网络在线·控制未就绪</span>');
+              var detail = [];
+              if (arm.ip) detail.push('IP: '+self._esc(arm.ip));
+              if (arm.port) detail.push('端口 '+self._esc(arm.port));
+              if (networkUp && !controlUp) detail.push('控制端口'+(arm.controlError === 'ECONNREFUSED' ? '拒绝连接' : '暂不可用'));
+              if (!networkUp && arm.networkError) detail.push(self._esc(arm.networkError));
+              return cell('机械臂 Marvin', tag, detail.join('　'));
             };
             var sensorRes = {};
             (d.sensors||[]).forEach(function(x){ if(x.id && x.width) sensorRes[x.id]=x.width+'×'+x.height; });
@@ -4196,7 +4391,7 @@
               questCellHtml+
               cell('手套（左）', tagFor(dv.gloves && dv.gloves.left, diagFor('gloves', 'left')), [gloveSn('left'), netOff(diagFor('gloves', 'left'))].filter(Boolean).join('　'))+
               cell('手套（右）', tagFor(dv.gloves && dv.gloves.right, diagFor('gloves', 'right')), [gloveSn('right'), netOff(diagFor('gloves', 'right'))].filter(Boolean).join('　'))+
-              (hasDexterousMachine && (dv.marvin || (dnet && dnet.roboticArm))?cell('机械臂 Marvin', tagFor(dv.marvin, dnet && dnet.roboticArm ? { connected: dnet.roboticArm.connected } : null), netOff(dnet && dnet.roboticArm)):'')+
+              (hasDexterousMachine ? roboticArmCell() : '')+
               ((dv.cameras && dv.cameras.length ? dv.cameras
                 : (d.camerasFps && d.camerasFps.length ? d.camerasFps
                   : (d.cameras && d.cameras.length ? d.cameras
@@ -4215,24 +4410,62 @@
             if (cf && cf.fps != null) {
               var a = cf.ageSec;
               var ageTxt = a == null ? '' : (a <= 60 ? '（录制中·实时）' : a < 3600 ? '（'+Math.round(a/60)+' 分钟前日志）' : '（'+Math.round(a/3600)+' 小时前日志）');
-              fpsParts.push('三路平均 '+Number(cf.fps).toFixed(1)+' fps'+ageTxt);
+              var measuredCameraCount = Number(cf.measuredCount || cf.cameraCount || 0);
+              fpsParts.push((measuredCameraCount ? measuredCameraCount+' 路平均 ' : '相机平均 ')+Number(cf.fps).toFixed(1)+' fps'+ageTxt);
             }
             if (d.vstFps) fpsParts.push('透视配置 '+d.vstFps+' fps');
             if (fpsParts.length) html += '<div style="font-size:11px;opacity:.65;margin-top:6px;">'+fpsParts.join(' · ')+'</div>';
           }
           html += '<div class="m-form-section-title" style="margin-top:10px;">采集器容器</div>';
+          var containerCards = (d.containers||[]).slice();
+          if (!containerCards.length && d.containerRoleStatus) {
+            Object.keys(d.containerRoleStatus).forEach(function(role){
+              var item = d.containerRoleStatus[role] || {};
+              if (item.name) containerCards.push({ name:item.name, role:role, status:item.running ? 'running' : 'exited' });
+            });
+          }
           html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;">'+
-            ((d.containers||[]).map(function(c){
+            (containerCards.map(function(c){
               var ok = c.status==='running';
               return '<span style="padding:2px 8px;border-radius:10px;font-size:12px;background:'+(ok?'#f6ffed':'#fff1f0')+';color:'+(ok?'#389e0d':'#cf1322')+';">'+self._esc(c.name)+': '+(ok?'运行中':self._esc(c.status))+'</span>';
             }).join('') || '<span style="opacity:.4;">-</span>')+'</div>';
+          if (d.collectorDiagnosticsStale) html += '<div style="background:#f5f5f5;border-radius:8px;padding:6px 10px;font-size:12px;color:#666;">采集程序未启动，无法判定当前降级部件；启动后会实时更新。</div>';
           if ((d.degraded||[]).length) html += '<div style="background:#fff7e6;border-radius:8px;padding:6px 10px;font-size:12px;color:#d46b08;">降级部件：'+self._esc(d.degraded.join('、'))+'</div>';
+          if ((d.deferredDegraded||[]).length) html += '<div style="color:#8c8c8c;font-size:11px;margin-top:5px;">待机检查项：'+self._esc(d.deferredDegraded.join('、'))+'（当前无采集任务，不作为设备故障）</div>';
           if ((d.errors||[]).length) html += '<div style="background:#fff1f0;border-radius:8px;padding:6px 10px;font-size:12px;color:#cf1322;margin-top:6px;">采集器错误 '+d.errors.length+' 条</div>';
-          html += '<div style="color:#8c8c8c;font-size:11px;text-align:right;margin-top:8px;">'+(d.source==='agent'
-            ? '数据来源：心跳快照（'+(d.dataAgeSec!=null?d.dataAgeSec:'?')+' 秒前上报，每 30 秒自动更新）'
-            : '数据来源：实时抓取')+'</div>';
+          var deviceProbeAge = null;
+          if (d.deviceSnapshotAt) {
+            var deviceProbeTime = new Date(d.deviceSnapshotAt).getTime();
+            if (Number.isFinite(deviceProbeTime)) deviceProbeAge = Math.max(0, Math.round((Date.now()-deviceProbeTime)/1000));
+          }
+          var sourceText = d.sources
+            ? '实时数据源：Importer '+(d.sources.importer==='websocket'?'WebSocket ✓':d.sources.importer==='api'?'API ✓':'不可达')+' · Collector '+(d.sources.collector==='api'?'API ✓':'不可达')+' · 设备探测 '+(d.sources.devices==='agent-api'?'API ✓'+(deviceProbeAge==null?'':'（'+deviceProbeAge+' 秒前）'):'不可达')
+            : (d.source==='agent' ? '数据来源：Agent 心跳快照（'+(d.dataAgeSec!=null?d.dataAgeSec:'?')+' 秒前上报）' : '数据来源：API 实时读取');
+          html += '<div style="color:#8c8c8c;font-size:11px;text-align:right;margin-top:8px;">'+sourceText+'</div>';
         }
-        html += '<div id="m-galio-host" style="margin-top:10px;">'+(self._galioCache || '<div class="m-form-section-title">主机状态 <span style="font-size:11px;opacity:.5;font-weight:normal;">Galio 巡检</span></div><div style="font-size:11px;color:#999;padding:4px;">加载中...</div>')+'</div>';
+        var host = d && d.performance && d.performance.host;
+        var hostPct = function(value) { return value != null && Number.isFinite(Number(value)) ? (Number(value) * 100).toFixed(1)+'%' : '-'; };
+        var hostColor = function(value, warn, critical) {
+          if (value == null || !Number.isFinite(Number(value))) return '#8c8c8c';
+          var percent = Number(value) * 100;
+          return percent >= critical ? '#cf1322' : (percent >= warn ? '#d46b08' : '#389e0d');
+        };
+        var hostCell = function(label, value, color) {
+          return '<div style="flex:1 1 30%;min-width:120px;background:#f7f8fa;border-radius:8px;padding:7px 9px;"><div style="font-size:11px;opacity:.55;margin-bottom:2px;">'+label+'</div><div style="font-size:13px;color:'+(color||'inherit')+';font-weight:600;">'+value+'</div></div>';
+        };
+        html += '<div style="margin-top:10px;"><div class="m-form-section-title">主机状态 <span style="font-size:11px;opacity:.5;font-weight:normal;">Agent 实时巡检</span></div>';
+        if (host) {
+          var checkedAt = host.checkedAt ? new Date(host.checkedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '-';
+          html += '<div style="display:flex;flex-wrap:wrap;gap:6px;">'+
+            hostCell('CPU', hostPct(host.cpuUsedRatio), hostColor(host.cpuUsedRatio, 70, 90))+
+            hostCell('内存', hostPct(host.memoryUsedRatio), hostColor(host.memoryUsedRatio, 70, 90))+
+            hostCell('磁盘', hostPct(host.diskUsedRatio), hostColor(host.diskUsedRatio, 75, 90))+
+            hostCell('负载', host.load1 != null ? Number(host.load1).toFixed(2) : '-', host.load1 != null && Number(host.load1) > 8 ? '#cf1322' : (host.load1 != null && Number(host.load1) > 4 ? '#d46b08' : '#389e0d'))+
+            '</div><div style="font-size:11px;color:#8c8c8c;text-align:right;margin-top:5px;">主机采样：'+self._esc(checkedAt)+'</div>';
+        } else {
+          html += '<div style="font-size:11px;color:#999;padding:4px;">等待 Agent 主机指标上报...</div>';
+        }
+        html += '</div>';
         return html;
       };
       var isAdmin = API.currentUser && (API.currentUser.role === 'admin' || API.currentUser.role === 'superadmin');
@@ -4242,8 +4475,14 @@
           ? '<button class="m-ms-act" id="m-ms-info-cmds" onclick="M._msOpenCmdSheet(\''+self._esc(num)+'\')">&#9881; 维护操作</button>'
           : '')+
         '</div>';
+      this._msInfoActiveTab = 'status';
+      var consoleTabs = '<div id="m-importer-tabs" style="display:flex;gap:5px;overflow-x:auto;padding:0 8px 8px;">'+
+        [['status','状态'],['collection','采集与容器'],['processing','数据处理'],['quality','数据质量'],['operations','运营数据']].map(function(tab){
+          return '<button class="m-sub-tab'+(tab[0]==='status'?' active':'')+'" data-importer-tab="'+tab[0]+'" onclick="M._msImporterConsoleTab(\''+self._esc(num)+'\',\''+tab[0]+'\')">'+tab[1]+'</button>';
+        }).join('')+'</div>';
       this.openModal('<div class="m-modal-header"><div class="m-modal-title">'+self._esc(num)+' · 机器状态信息</div>'+
         '<button class="m-modal-close" onclick="M.closeModal()">×</button></div>'+
+        consoleTabs+
         '<div id="m-ms-info-body" style="max-height:70vh;overflow-y:auto;"><div class="m-empty"><div class="m-empty-text">正在从采集器读取状态...</div></div></div>'+
         actionsBar);
       var load = async function(forceLive) {
@@ -4256,56 +4495,17 @@
         } catch(e) { errMsg = '无法连接采集器：'+(e && e.message ? e.message : '网络错误'); }
         var cur = document.getElementById('m-ms-info-body');
         if (cur) cur.innerHTML = render(d, errMsg);
-        self._msLoadGalioHost(num);
       };
 
       this._msInfoLoad = load;
       await load();
       var self2 = this;
-      if (this._galioTimer) clearInterval(this._galioTimer);
-      this._galioTimer = setInterval(function() { self2._msLoadGalioHost(num); }, 30000);
       this._msInfoCtrl = API.streamMachineLive(num, function(d) {
         var cur = document.getElementById('m-ms-info-body');
         if (!cur) { if (self2._msInfoCtrl) { try { self2._msInfoCtrl.abort(); } catch (e) { } self2._msInfoCtrl = null; } return; }
-        cur.innerHTML = render(d, null);
+        self2._msInfoLastData = d;
+        if (self2._msInfoActiveTab === 'status') cur.innerHTML = render(d, null);
       });
-    },
-    async _msLoadGalioHost(num) {
-      var self = this;
-      var box = document.getElementById('m-galio-host');
-      if (!box) return;
-      try {
-        var resp = await fetch('http://10.5.51.216:8000/stations/by-code/'+encodeURIComponent(num)+'/latest-metrics', {signal: AbortSignal.timeout(3000)});
-        var body = await resp.json();
-        if (body.code !== 0 || !body.data) { var b=document.getElementById('m-galio-host'); if(b) b.innerHTML='<div style="font-size:11px;color:#999;padding:4px;">Galio 无数据</div>'; return; }
-        var d = body.data.metrics || {};
-        var pct = function(v) { return v != null ? (v*100).toFixed(1)+'%' : '-'; };
-        var gb = function(v, warn, crit) {
-          if (v == null) return '#8c8c8c';
-          var p = v*100;
-          if (p >= crit) return '#cf1322';
-          if (p >= warn) return '#d46b08';
-          return '#389e0d';
-        };
-        var cell2 = function(label, valHtml, color) {
-          return '<div style="flex:1 1 30%;min-width:120px;background:#f7f8fa;border-radius:8px;padding:7px 9px;">'+
-            '<div style="font-size:11px;opacity:.55;margin-bottom:2px;">'+label+'</div>'+
-            '<div style="font-size:13px;color:'+(color||'inherit')+';font-weight:600;">'+valHtml+'</div></div>';
-        };
-        var html = '<div class="m-form-section-title" style="margin-top:6px;">主机状态 <span style="font-size:11px;opacity:.5;font-weight:normal;">Galio 巡检</span></div>';
-        html += '<div style="display:flex;flex-wrap:wrap;gap:6px;">';
-        html += cell2('CPU', pct(d.host_cpu_used_ratio), gb(d.host_cpu_used_ratio,70,90));
-        html += cell2('内存', pct(d.host_mem_used_ratio), gb(d.host_mem_used_ratio,70,90));
-        html += cell2('磁盘', pct(d.host_disk_used_ratio), gb(d.host_disk_used_ratio,75,90));
-        html += cell2('负载', d.host_load1!=null?Number(d.host_load1).toFixed(2):'-', d.host_load1!=null&&d.host_load1>8?'#cf1322':d.host_load1!=null&&d.host_load1>4?'#d46b08':'#389e0d');
-        html += '</div>';
-        var cur = document.getElementById('m-galio-host');
-        if (cur) cur.innerHTML = html;
-        self._galioCache = html;
-      } catch(e) {
-        var cur2 = document.getElementById('m-galio-host');
-        if (cur2) cur2.innerHTML = self._galioCache || '';
-      }
     },
     async _msInfoLive() {
       if (this._msInfoLoading) return;
@@ -4318,6 +4518,134 @@
         if (b) { b.disabled = false; b.innerHTML = '&#8635; 实时刷新'; }
         this._msInfoLoading = false;
       }
+    },
+    async _msImporterConsoleTab(num, section) {
+      this._msInfoActiveTab = section;
+      var self = this;
+      document.querySelectorAll('#m-importer-tabs [data-importer-tab]').forEach(function(btn) {
+        btn.classList.toggle('active', btn.getAttribute('data-importer-tab') === section);
+      });
+      var box = document.getElementById('m-ms-info-body');
+      if (!box) return;
+      if (section === 'status') {
+        if (this._msInfoLoad) await this._msInfoLoad(true);
+        return;
+      }
+      box.innerHTML = '<div class="m-empty"><div class="m-empty-text">正在读取 Importer API...</div></div>';
+      try {
+        var result = await API.getImporterConsole(num, section);
+        if (this._msInfoActiveTab !== section) return;
+        box.innerHTML = this._msRenderImporterConsole(num, section, result);
+      } catch (e) {
+        if (this._msInfoActiveTab === section) box.innerHTML = '<div class="m-empty"><div class="m-empty-text">'+self._esc((e&&e.message)||'读取失败')+'</div></div>';
+      }
+    },
+    _msRenderImporterConsole(num, section, response) {
+      var self = this;
+      if (!response || !response.success) return '<div class="m-empty"><div class="m-empty-text">'+self._esc((response&&response.error)||'Importer API 不可达')+'</div></div>';
+      var d = response.data || {};
+      var esc = function(v){ return self._esc(v == null ? '-' : String(v)); };
+      var card = function(label, value, detail) {
+        return '<div style="flex:1 1 29%;min-width:125px;background:#f7f8fa;border-radius:8px;padding:8px 9px;"><div style="font-size:11px;color:#8c8c8c;">'+label+'</div><div style="font-size:14px;font-weight:600;margin-top:2px;word-break:break-word;">'+value+'</div>'+(detail?'<div style="font-size:11px;color:#8c8c8c;margin-top:3px;">'+detail+'</div>':'')+'</div>';
+      };
+      var cards = function(items){ return '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">'+items.join('')+'</div>'; };
+      var table = function(headers, rows) {
+        return '<div style="overflow-x:auto;margin-bottom:10px;"><table style="width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap;"><tr>'+headers.map(function(h){return '<th style="text-align:left;padding:6px;border-bottom:1px solid #ddd;background:#fafafa;">'+h+'</th>';}).join('')+'</tr>'+rows.map(function(row){return '<tr>'+row.map(function(v){return '<td style="padding:6px;border-bottom:1px solid #f0f0f0;max-width:220px;overflow:hidden;text-overflow:ellipsis;">'+v+'</td>';}).join('')+'</tr>';}).join('')+'</table></div>';
+      };
+      var details = function(label, value) {
+        var raw = '';
+        try { raw = JSON.stringify(value, null, 2); } catch (e) { raw = String(value); }
+        if (raw.length > 50000) raw = raw.slice(0, 50000)+'\n… 数据过长，已截断显示；接口返回值未截断';
+        return '<details style="margin:6px 0;"><summary style="cursor:pointer;color:#5b6b82;font-size:12px;">'+label+'</summary><pre style="font-size:10px;line-height:1.35;background:#f7f8fa;border-radius:6px;padding:8px;white-space:pre-wrap;word-break:break-all;max-height:360px;overflow:auto;">'+esc(raw)+'</pre></details>';
+      };
+      var html = '';
+      var sectionTitle = function(t){ return '<div class="m-form-section-title" style="margin-top:10px;">'+t+'</div>'; };
+      if (section === 'collection') {
+        var health = d.health || {}, runtime = d.runtime || {}, states = d.containerStates || {}, stats = d.containerStats || {};
+        html += sectionTitle('采集运行态')+cards([
+          card('Importer', esc((d.version&&d.version.version)||health.version), esc((d.version&&d.version.channel)||health.channel||'')),
+          card('采集程序', health.is_collector_alive?'<span style="color:#389e0d;">运行中</span>':'<span style="color:#999;">未运行</span>', esc(runtime.collector||'')),
+          card('登录状态', health.is_logged_in?'<span style="color:#389e0d;">已登录</span>':'未登录', esc(health.activity||'')),
+          card('Collector UI', runtime.ui_port?esc(runtime.ui_port):'-', runtime.is_exodus?'Exodus':''),
+          card('引擎', esc((d.engine&&d.engine.engine)||'-'), '下次创建生效'),
+          card('Rig / Shape', esc((d.rig&&d.rig.rig)||'-')+' / '+esc((d.shape&&d.shape.shape)||'-'), '下次创建生效'),
+          card('通道', esc((d.channel&&d.channel.channel)||health.collector_channel||'-'), esc((d.channel&&d.channel.image)||'')),
+          card('升级状态', esc((d.updateState&&d.updateState.gate&&d.updateState.gate.state)||'无'), '')
+        ]);
+        html += sectionTitle('容器');
+        var containerRows = Object.keys(states).map(function(name){
+          var stat = null;
+          (stats.pools||[]).forEach(function(pool){ (pool.containers||[]).forEach(function(c){ if(c.name===name) stat=c; }); });
+          return [esc(name), esc(states[name]), stat?esc(Number(stat.cpu_percent||0).toFixed(1)+'%'):'-', stat?esc((Number(stat.mem_usage_bytes||0)/1048576).toFixed(0)+' MB'):'-'];
+        });
+        html += table(['容器','状态','CPU','内存'], containerRows);
+        html += sectionTitle('辅助工具')+table(['名称','状态','入口'], (d.tools||[]).map(function(x){return [esc(x.name||'-'),esc(x.status||'-'),esc(x.exodus_path||'-')];}));
+        if (response.canOperate && response.actions && response.actions.length) {
+          html += sectionTitle('Importer 运维控制（Agent 本机执行）')+'<div style="display:flex;flex-wrap:wrap;gap:6px;">'+response.actions.map(function(a){
+            return '<button class="m-btn m-btn-sm" style="'+(a.danger?'color:#cf1322;border-color:#ffccc7;':'')+'" onclick="M._msRunImporterAction(\''+esc(num)+'\',\''+esc(a.key)+'\',\''+esc(a.label)+'\','+(a.danger?'true':'false')+','+esc(JSON.stringify(a.fields||[]))+')">'+esc(a.label)+'</button>';
+          }).join('')+'</div>';
+        } else if (response.canOperate) {
+          var agentReason = response.agent && response.agent.reachable
+            ? '当前 Agent '+esc(response.agent.version||'-')+' 不支持运维动作，或本机 Importer 未提供可执行接口'
+            : '当前 Agent 不可达，运维按钮已禁用';
+          html += sectionTitle('Importer 运维控制（Agent 本机执行）')+
+            '<div style="background:#fff7e6;color:#d46b08;border-radius:8px;padding:8px;font-size:12px;">'+agentReason+'</div>';
+        }
+        html += details('启动选择与可用配置', {engine:d.engine,launch:d.launch,rig:d.rig,shape:d.shape,channel:d.channel,selections:d.selections,launchEpisodes:d.launchEpisodes});
+      } else if (section === 'processing') {
+        var ov = d.overview || {}, q = d.queue || {};
+        html += cards([card('Episode 总数',esc(ov.total||0)),card('处理中',esc(ov.busy||0)),card('等待',esc(ov.pending||0)),card('完成',esc(ov.done||0)),card('卡住',esc(ov.stalled||0)),card('队列利用率',esc(q.utilization_percent==null?'-':q.utilization_percent+'%'))]);
+        html += sectionTitle('处理 Worker')+table(['Worker','忙碌','等待','可用容量','利用率'], (d.workers||[]).map(function(x){return [esc(x.name),esc(x.busy),esc(x.pending),esc(x.available_capacity),esc(x.utilization_percent==null?'-':x.utilization_percent+'%')];}));
+        html += sectionTitle('Workflow')+table(['Workflow','忙碌','等待','利用率'], (d.workflows||[]).map(function(x){return [esc(x.name),esc(x.busy),esc(x.pending),esc(x.utilization_percent==null?'-':x.utilization_percent+'%')];}));
+        html += sectionTitle('最近 Episode')+table(['Episode','状态','步骤','Worker','Workflow'], (d.recentEpisodes||[]).slice(0,50).map(function(x){return [esc(x.episode_id),esc(x.status),esc(x.step),esc(x.worker),esc(x.workflow)];}));
+      } else if (section === 'quality') {
+        var latest = d.latest || {}, reports = (d.reports&&d.reports.items)||[], incidents=(d.incidents&&d.incidents.items)||d.incidents||[], calibrations=(d.calibrations&&d.calibrations.items)||[];
+        html += cards([card('最新质检',esc(latest.status||'暂无'),esc(latest.episode_id||'')),card('报告数量',esc(reports.length),'本次最多 20 条'),card('开放事件',esc(incidents.length)),card('校准记录',esc(calibrations.length))]);
+        html += sectionTitle('最近质量报告')+table(['Episode','状态','时间','结果'], reports.slice(0,20).map(function(x){var p=x.payload||x;return [esc(x.episode_id||p.episode_id),esc(x.status||p.status),esc(x.occurred_at||''),esc(p.counts?JSON.stringify(p.counts):'')];}));
+        html += sectionTitle('开放事件')+table(['事件','级别','状态','详情'], incidents.slice(0,50).map(function(x){return [esc(x.kind||x.id),esc(x.severity),esc(x.status||'open'),esc(x.detail||'')];}));
+        html += details('校准记录', d.calibrations)+details('Episode 保存记录', d.episodes);
+      } else if (section === 'operations') {
+        var oo=d.overview||{}, acts=(d.activities&&d.activities.items)||[], entries=(d.timeline&&d.timeline.entries)||[];
+        html += cards([card('上机时长',esc(Math.round(Number(oo.attended_seconds||0)/60))+' 分钟'),card('质量通过率',oo.quality_pass_rate==null?'-':esc((Number(oo.quality_pass_rate)*100).toFixed(1)+'%')),card('运行批次',esc((oo.runs||[]).length)),card('会话',esc((oo.sessions||[]).length)),card('开放事件',esc((oo.incidents&&oo.incidents.open_count)||0)),card('机器 ID',esc(oo.machine_id||'-'))]);
+        html += sectionTitle('最近活动')+table(['时间','类别','事件','状态','Episode'], acts.slice(-50).reverse().map(function(x){return [esc(x.occurred_at),esc(x.category),esc(x.kind),esc(x.status),esc(x.episode_id)];}));
+        html += sectionTitle('运营时间线')+table(['时间','类别','事件','状态'], entries.slice(-100).reverse().map(function(x){return [esc(x.occurred_at),esc(x.category),esc(x.kind||x.event),esc(x.status)];}));
+        html += details('启动/停止成功率', oo.attempts)+details('当前故障统计', oo.faults)+details('会话与运行记录', {sessions:oo.sessions,runs:oo.runs});
+      }
+      var errorKeys = Object.keys(response.errors||{});
+      if (errorKeys.length) html += '<div style="margin-top:10px;background:#fff7e6;color:#d46b08;border-radius:8px;padding:8px;font-size:11px;">部分接口读取失败：'+errorKeys.map(function(k){return esc(k)+' ('+esc(response.errors[k])+')';}).join('、')+'</div>';
+      var wsNames=Object.keys(response.realtime||{});
+      html += '<div style="color:#8c8c8c;font-size:11px;text-align:right;margin-top:8px;">Importer '+(wsNames.length?'WebSocket '+wsNames.join('/')+' · ':'')+'API 对账 · '+esc(response.fetchedAt||'')+'</div>';
+      return html;
+    },
+    async _msRunImporterAction(num, action, label, danger, fields) {
+      var payload = {};
+      fields = Array.isArray(fields) ? fields : [];
+      for (var i=0;i<fields.length;i++) {
+        var field=fields[i], value;
+        if (field==='is_autopilot' || field==='override_config_channel') value=confirm(field==='is_autopilot'?'是否使用自动驾驶模式？':'是否覆盖机器配置中的通道？');
+        else if (field==='params') {
+          value=prompt('请输入 params JSON（留空使用默认值）','');
+          if (value) { try { value=JSON.parse(value); } catch(e) { this.toast('params 不是有效 JSON'); return; } }
+          else value={};
+        } else {
+          var title={container_name:'容器名称',name:'辅助工具名称',password:'升级密码',channel:'通道（留空为默认）',engine:'引擎（留空为默认）',rig:'Rig（留空为默认）',shape:'Shape（留空为默认）',task:'启动任务（留空为默认）'}[field]||field;
+          value=prompt('请输入'+title,'');
+          if (value===null) return;
+          if (field==='password' && !value) { this.toast('升级密码不能为空'); return; }
+          if (!value && ['channel','engine','rig','shape','task'].indexOf(field)>=0) value=null;
+        }
+        payload[field]=value;
+      }
+      var warning=(danger?'危险操作：':'确认执行：')+label+'\n机器：'+num;
+      if (!confirm(warning)) return;
+      try {
+        this.toast(label+'执行中...');
+        var result=await API.runImporterAction(num,action,payload);
+        if (result&&result.success) {
+          this.toast(label+'执行成功（Agent）');
+          await this._msImporterConsoleTab(num,'collection');
+        } else this.toast((result&&result.error)||'操作失败');
+      } catch(e) { this.toast((e&&e.message)||'操作失败'); }
     },
     _msOpenCmdSheet(num) {
       this._msCloseSheet();
@@ -4336,24 +4664,42 @@
         var numM = /(?:we|szx3)-(\d+)/.exec(num || '');
         hasQuest = numM && parseInt(numM[1], 10) >= 100;
       }
-      var items = '';
-      if (hasQuest && !isGloveOnly) items += '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-diag" onclick="M._msChooseDiagnoseHands(\''+self._esc(num)+'\')">&#128269; 灵巧手检测（故障/温度/电压/通信）</button>'+
+      var quickItems = '';
+      if (hasQuest && !isGloveOnly) quickItems += '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-diag" onclick="M._msChooseDiagnoseHands(\''+self._esc(num)+'\')">&#128269; 灵巧手检测（故障/温度/电压/通信）</button>'+
         '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-fix" onclick="M._msSheetCmd(\'fix\',\''+self._esc(num)+'\')">修复 Quest 连接（授权相机并重启应用）</button>'+
         '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-cfg" onclick="M._msMachineConfig(\''+self._esc(num)+'\')">&#128221; 查看机器配置</button>';
       // 机械臂入口不依赖 Quest SN/实时快照，避免采集器未启动时维护弹窗无法打开。
-      if (!isGloveOnly) items += '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-arm" onclick="M._msArmControl(\''+self._esc(num)+'\')">&#129302; 机械臂状态切换</button>';
+      if (!isGloveOnly) quickItems += '<button class="m-sheet-item m-sheet-item-fix" id="m-sheet-arm" onclick="M._msArmControl(\''+self._esc(num)+'\')">&#129302; 机械臂状态切换</button>';
+      quickItems += '<button class="m-sheet-item m-sheet-item-fix" onclick="M._msCloseSheet();M._msImporterConsoleTab(\''+self._esc(num)+'\',\'collection\')">&#9881; Importer 全部运维与采集控制</button>';
       var collectorStatus = latest && latest.containerRoleStatus && latest.containerRoleStatus.collector;
       var collectorName = (collectorStatus && collectorStatus.name) || (latest && latest.containerRoles && latest.containerRoles.collector) || 'main';
       var collectorState = collectorStatus && collectorStatus.running === false ? (collectorStatus.status || '已停止') : '运行中';
-      items += '<button class="m-sheet-item m-sheet-item-danger" id="m-sheet-mono" onclick="M._msSheetCmd(\'mono\',\''+self._esc(num)+'\')">&#9632; 停止 '+self._esc(collectorName)+' 容器（'+self._esc(collectorState)+'）</button>'+
-        '<button class="m-sheet-item m-sheet-item-danger" id="m-sheet-exodus" onclick="M._msSheetCmd(\'exodus\',\''+self._esc(num)+'\')">&#9632; 停止 exodus 容器</button>'+
-        '<div class="m-sheet-sep">&#9881; 运维命令</div><div id="m-sheet-cmdlist"><div class="m-empty-text" style="padding:8px 0;font-size:12px;">命令加载中...</div></div>';
+      var dangerItems = '<button class="m-sheet-item m-sheet-item-danger" id="m-sheet-mono" onclick="M._msSheetCmd(\'mono\',\''+self._esc(num)+'\')">&#9632; 停止 '+self._esc(collectorName)+' 容器（'+self._esc(collectorState)+'）</button>'+
+        '<button class="m-sheet-item m-sheet-item-danger" id="m-sheet-exodus" onclick="M._msSheetCmd(\'exodus\',\''+self._esc(num)+'\')">&#9632; 停止 exodus 容器</button>';
+      var section = function(id, label, body, open, danger) {
+        return '<div class="m-sheet-group'+(danger?' m-sheet-group-danger':'')+'">'+
+          '<button class="m-sheet-group-toggle'+(open?' is-open':'')+'" id="'+id+'-toggle" aria-expanded="'+(open?'true':'false')+'" onclick="M._msToggleCmdSection(\''+id+'\')">'+
+            '<span>'+label+'</span><span class="m-sheet-chevron">⌄</span></button>'+
+          '<div class="m-sheet-group-body" id="'+id+'"'+(open?'':' hidden')+'>'+body+'</div></div>';
+      };
+      var items = section('m-sheet-quick', '常用维护', quickItems || '<div class="m-sheet-empty">此机器暂无常用维护项</div>', true, false)+
+        section('m-sheet-danger', '容器控制（危险操作）', dangerItems, false, true)+
+        section('m-sheet-commands', '运维命令', '<div id="m-sheet-cmdlist"><div class="m-empty-text" style="padding:8px 0;font-size:12px;">命令加载中...</div></div>', false, false);
       var html = '<div class="m-sheet-mask" id="m-cmd-sheet" onclick="if(event.target===this)M._msCloseSheet()">'+
         '<div class="m-sheet"><div class="m-sheet-title">'+self._esc(num)+' · 维护操作</div>'+
         items+
         '<button class="m-sheet-item m-sheet-cancel" onclick="M._msCloseSheet()">取消</button></div></div>';
       document.body.insertAdjacentHTML('beforeend', html);
       this._msLoadCmdButtons(num);
+    },
+    _msToggleCmdSection(id) {
+      var body = document.getElementById(id);
+      var toggle = document.getElementById(id+'-toggle');
+      if (!body || !toggle) return;
+      var willOpen = body.hidden;
+      body.hidden = !willOpen;
+      toggle.classList.toggle('is-open', willOpen);
+      toggle.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
     },
     async _msLoadCmdButtons(num) {
       var self = this;

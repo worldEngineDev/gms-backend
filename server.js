@@ -73,9 +73,11 @@ const createRoleHandlers = require('./src/handlers/rbac-roles');
 const createBatchHandlers = require('./src/handlers/batches');
 const createWarehouseTransferHandlers = require('./src/handlers/warehouse-transfers');
 const { createRbacEngine } = require('./lib/rbac');
+const { createGalioClient, loadGalioStations } = require('./lib/galio');
 // const createAgentHandlers = require('./src/handlers/agent');
 let auth, users, transactions, inventory, machines, snRegistry, techSupport, edge, push, chat, sop, solutions, configuration, replacement, storageLocations, stocktakes, warehousesDomain, rbacRoles, batchesDomain, warehouseTransfers; // , agent;
 let rbacEngine; // lib/rbac.js 引擎（can/getRole/listRoles），startup 内创建
+let galioPool;
 // S3: sendJSON injected into router so validation errors return proper 400 JSON
 const publicRouter = createRouter({ sendJSON: (...args) => sendJSON(...args) });  // routes dispatched BEFORE requireAuth
 const authRouter = createRouter({ sendJSON: (...args) => sendJSON(...args) });    // routes dispatched AFTER requireAuth gate
@@ -383,6 +385,19 @@ function initDB() {
       updatedAt VARCHAR(64),
       INDEX idx_edge_status (status),
       INDEX idx_edge_lastseen (lastSeen)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    // Agent 告警事件审计：只记录 raised/confirmed/resolved，不记录每一次心跳。
+    `CREATE TABLE IF NOT EXISTS edge_alert_events (
+      id VARCHAR(64) PRIMARY KEY,
+      machineNumber VARCHAR(64) NOT NULL,
+      fingerprint VARCHAR(512) NOT NULL,
+      eventType VARCHAR(16) NOT NULL,
+      alertCode VARCHAR(64) DEFAULT '',
+      level VARCHAR(32) DEFAULT '',
+      data MEDIUMTEXT,
+      createdAt VARCHAR(64) NOT NULL,
+      INDEX idx_edge_alert_machine_time (machineNumber, createdAt),
+      INDEX idx_edge_alert_fingerprint (fingerprint(191), createdAt)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     // 机器生产状态（可生产 ready / 在生产 in_production / 待维修 waiting_repair / 在测试 testing）
     // 与 machines 表的设备挂接状态（online/offline）相互独立；waiting_repair 由工单驱动
@@ -3520,6 +3535,7 @@ async function startup() {
     });
     edge = createEdgeHandlers({ pool, redisClient, sendJSON, broadcastSSE, broadcastChange, syncInventoryFromSN: _syncInventoryFromSN });
     edge.startSweeper();
+    galioPool = createGalioClient();
     machines = createMachinesHandlers({
       pool, sendJSON,
       _cached, _cache,
@@ -3529,7 +3545,11 @@ async function startup() {
       _snToInvType,
       broadcastChange, broadcastSSE,
       loadEdgePresence: edge.loadEdgePresence,
-      getEdgeLive: require('./src/edge-live').getEdgeLive
+      getEdgeLive: require('./src/edge-live').getEdgeLive,
+      loadGalioStations: async () => {
+        try { return await loadGalioStations(galioPool); }
+        catch (e) { console.warn('[Galio] 聚合读取失败:', e.message); return {}; }
+      }
     });
     snRegistry = createSNRegistryHandlers({
       pool, sendJSON,
@@ -3709,6 +3729,9 @@ async function startup() {
     // 运营端机器状态中心：登录、任务、Hermes、处理队列、上传及全天会话聚合
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/operations-center$/, 'GET', machines.handleGetOperationsCenter, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/live$/, 'GET', machines.handleGetMachineLive, { auth:'required' });
+    authRouter.register('/api/machines/status-center-live', 'GET', machines.handleGetStatusCenterLive, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/importer-console$/, 'GET', machines.handleGetImporterConsole, { auth:'required' });
+    authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/importer-action$/, 'POST', machines.handleImporterAction, { auth:'required', body:true });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/stop-collector$/, 'POST', machines.handleStopCollector, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/stop-exodus$/, 'POST', machines.handleStopExodus, { auth:'required' });
     authRouter.registerPattern(/^\/api\/machines\/([^/]+)\/fix-quest$/, 'POST', machines.handleFixQuest, { auth:'required' });
@@ -4041,7 +4064,19 @@ async function startup() {
       const machineNumber = String(u.searchParams.get('machine') || '').trim().toLowerCase();
       if (!machineNumber || token !== (process.env.EDGE_TOKEN || '')) { ws.close(4001, 'unauthorized'); return; }
       edgeLive.markEdgeWsConnected(machineNumber, true);
-      ws.on('message', raw => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'fast' && msg.data) edgeLive.setEdgeLive(machineNumber, msg.data); } catch {} });
+      // Older agents push a large duplicate snapshot every two seconds. Parse
+      // at most one per machine per ten seconds so a fleet of clients cannot
+      // monopolize the Node event loop; HTTP heartbeats remain authoritative.
+      let lastAcceptedAt = 0;
+      ws.on('message', raw => {
+        const now = Date.now();
+        if (now - lastAcceptedAt < 10000) return;
+        lastAcceptedAt = now;
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.type === 'fast' && msg.data) edgeLive.setEdgeLive(machineNumber, msg.data);
+        } catch {}
+      });
       ws.on('close', () => edgeLive.markEdgeWsConnected(machineNumber, false));
     });
 

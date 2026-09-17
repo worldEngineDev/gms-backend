@@ -985,6 +985,24 @@ const API = {
     return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/info' + (opts && opts.refresh ? '?refresh=1' : ''));
   },
 
+  async getMachineStatusCenterLive() {
+    return await this._fetch('GET', '/api/machines/status-center-live', null, 20000);
+  },
+
+  async getImporterConsole(machineNumber, section, opts) {
+    var query = '?section=' + encodeURIComponent(section || 'collection');
+    if (opts && opts.since != null) query += '&since=' + encodeURIComponent(opts.since);
+    if (opts && opts.until != null) query += '&until=' + encodeURIComponent(opts.until);
+    return await this._fetch('GET', '/api/machines/' + encodeURIComponent(machineNumber) + '/importer-console' + query, null, 30000);
+  },
+
+  async runImporterAction(machineNumber, action, payload) {
+    return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/importer-action', {
+      action: action,
+      payload: payload || {},
+    }, 190000);
+  },
+
   async stopCollector(machineNumber) {
     return await this._fetch('POST', '/api/machines/' + encodeURIComponent(machineNumber) + '/stop-collector');
   },
@@ -1030,33 +1048,50 @@ const API = {
     const ctrl = new AbortController();
     const headers = { Accept: 'text/event-stream' };
     if (this.token) headers['Authorization'] = `Bearer ${  this.token}`;
-    fetch(`${this.baseURL  }/api/machines/${  encodeURIComponent(machineNumber)  }/live`, {
-      method: 'GET',
-      credentials: 'same-origin',
-      headers,
-      signal: ctrl.signal,
-    }).then(async (res) => {
-      if (!res.ok || !res.body) throw new Error('SSE ' + res.status);
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      for (;;) {
-        const r = await reader.read();
-        if (r.done) break;
-        buf += decoder.decode(r.value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf('\n\n')) !== -1) {
-          const chunk = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          const line = chunk.split('\n').find((l) => l.startsWith('data:'));
-          if (!line) continue;
-          try {
-            const data = JSON.parse(line.slice(5).trim());
-            if (data && data.success !== false) onData(data);
-          } catch (e) { /* 半包忽略 */ }
+    let stopped = false;
+    let retryTimer = null;
+    const reconnect = () => {
+      if (stopped || ctrl.signal.aborted) return;
+      retryTimer = setTimeout(connect, 1500);
+    };
+    const connect = () => {
+      if (stopped || ctrl.signal.aborted) return;
+      fetch(`${this.baseURL  }/api/machines/${  encodeURIComponent(machineNumber)  }/live`, {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers,
+        signal: ctrl.signal,
+      }).then(async (res) => {
+        if (!res.ok || !res.body) throw new Error('SSE ' + res.status);
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const r = await reader.read();
+          if (r.done) break;
+          buf += decoder.decode(r.value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const chunk = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const line = chunk.split('\n').find((l) => l.startsWith('data:'));
+            if (!line) continue;
+            try {
+              const data = JSON.parse(line.slice(5).trim());
+              if (data && data.success !== false) onData(data);
+            } catch (e) { /* 半包忽略 */ }
+          }
         }
-      }
-    }).catch(() => { });
+        reconnect();
+      }).catch(() => reconnect());
+    };
+    const abort = ctrl.abort.bind(ctrl);
+    ctrl.abort = () => {
+      stopped = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      abort();
+    };
+    connect();
     return ctrl;
   },
 

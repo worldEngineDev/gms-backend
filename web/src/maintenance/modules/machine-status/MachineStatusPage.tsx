@@ -449,8 +449,11 @@ export default function MachineStatusPage() {
             const d = r?.details || {};
             const parts: string[] = [];
             if (d.reason) parts.push(String(d.reason));
-            if (Array.isArray(d.degraded) && d.degraded.length) {
-              parts.push(`采集组件降级：${d.degraded.join('、')}`);
+            const actionableDegraded = Array.isArray(d.degraded) ? d.degraded.filter((key: string) =>
+              key !== 'calibration/camera_pairing' && key !== 'gello/wuji_glove_l' && key !== 'gello/wuji_glove_r'
+            ) : [];
+            if (actionableDegraded.length) {
+              parts.push(`采集组件降级：${actionableDegraded.join('、')}`);
             }
             if (Array.isArray(d.alerts)) {
               for (const alert of d.alerts) {
@@ -880,7 +883,7 @@ export default function MachineStatusPage() {
                   ))}
                   {!info.containers?.length && <span style={{ opacity: 0.45 }}>-</span>}
                 </Flex>
-                {collectorStarted && !!info.degraded?.length && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message={`降级部件：${info.degraded.join('、')}`} />}
+                {collectorStarted && !!(info.degraded || []).filter((key: string) => key !== 'calibration/camera_pairing' && key !== 'gello/wuji_glove_l' && key !== 'gello/wuji_glove_r').length && <Alert type="warning" showIcon style={{ marginBottom: 8 }} message={`降级部件：${(info.degraded || []).filter((key: string) => key !== 'calibration/camera_pairing' && key !== 'gello/wuji_glove_l' && key !== 'gello/wuji_glove_r').join('、')}`} />}
                 {collectorStarted && !!info.errors?.length && <Alert type="error" showIcon message={`采集器错误：${info.errors.length} 条`} description={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{JSON.stringify(info.errors, null, 2)}</pre>} />}
               </Card>
               <div style={{ color: '#8c8c8c', fontSize: 12, textAlign: 'right' }}>

@@ -24,8 +24,68 @@ const TICKET_RULES = {
 
 const DEFAULT_TICKET_CODES = ['hand_mismatch', 'sn_unusable', 'sn_bound_elsewhere', 'unregistered_sn', 'collector_degraded'];
 const TICKET_RETRY_MS = 10 * 60 * 1000;
+const IMMEDIATE_ALERT_CODES = new Set(['emergency_stopped']);
 
-module.exports = function createEdgeHandlers(deps) {
+function normalizedAlertPart(value) {
+  return String(value == null ? '' : value).trim().replace(/\s+/g, ' ').slice(0, 240);
+}
+
+function alertFingerprint(alert) {
+  const details = alert && alert.details && typeof alert.details === 'object' ? alert.details : {};
+  const components = Array.isArray(alert && alert.components) ? [...alert.components].map(String).sort().join(',') : '';
+  const errors = Array.isArray(details.errors)
+    ? details.errors.slice(0, 10).map(item => normalizedAlertPart(
+      typeof item === 'string' ? item : (item && (item.code || item.message || item.error || JSON.stringify(item)))
+    )).sort().join('|')
+    : '';
+  return [alert && alert.code, alert && alert.kind, alert && alert.hand, alert && alert.snCode, components, errors]
+    .map(normalizedAlertPart).join(':');
+}
+
+// 告警仍会立即展示；只有持续两个心跳的非急停告警才标记为 confirmed，
+// 供自动工单和外部通知使用，避免短暂的 API/设备抖动制造工单风暴。
+function applyAlertLifecycle(alerts, previousAlerts, now) {
+  const previous = new Map((Array.isArray(previousAlerts) ? previousAlerts : []).map(alert => [
+    alert.fingerprint || alertFingerprint(alert), alert,
+  ]));
+  const active = [];
+  const events = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(alerts) ? alerts : []) {
+    const fingerprint = alertFingerprint(raw);
+    const prior = previous.get(fingerprint);
+    const occurrenceCount = Number(prior && prior.occurrenceCount || 0) + 1;
+    const confirmed = IMMEDIATE_ALERT_CODES.has(raw.code) || occurrenceCount >= 2;
+    const alert = {
+      ...raw,
+      fingerprint,
+      firstDetectedAt: prior && prior.firstDetectedAt || now,
+      lastDetectedAt: now,
+      occurrenceCount,
+      confirmed,
+    };
+    active.push(alert);
+    seen.add(fingerprint);
+    if (!prior) events.push({ type: 'raised', alert });
+    else if (!prior.confirmed && confirmed) events.push({ type: 'confirmed', alert });
+  }
+  for (const [fingerprint, prior] of previous) {
+    if (seen.has(fingerprint)) continue;
+    const started = Date.parse(prior.firstDetectedAt || prior.lastDetectedAt || now);
+    events.push({
+      type: 'resolved',
+      alert: {
+        ...prior,
+        fingerprint,
+        resolvedAt: now,
+        durationSec: Number.isFinite(started) ? Math.max(0, Math.round((Date.parse(now) - started) / 1000)) : null,
+      },
+    });
+  }
+  return { alerts: active, events };
+}
+
+function createEdgeHandlers(deps) {
   const { pool, redisClient, sendJSON, broadcastSSE } = deps;
   const broadcastChange = typeof deps.broadcastChange === 'function' ? deps.broadcastChange : null;
   const syncInventoryFromSN = typeof deps.syncInventoryFromSN === 'function' ? deps.syncInventoryFromSN : null;
@@ -77,6 +137,32 @@ module.exports = function createEdgeHandlers(deps) {
   async function _clearRedisPresence(machineNumber) {
     if (!redisClient || typeof redisClient.del !== 'function') return;
     try { await redisClient.del(`edge:presence:${machineNumber}`); } catch {}
+  }
+
+  async function _recordAlertEvents(machineNumber, events) {
+    if (!Array.isArray(events) || events.length === 0) return;
+    for (const event of events.slice(0, 50)) {
+      const alert = event.alert || {};
+      try {
+        await pool.execute(
+          `INSERT INTO edge_alert_events (id, machineNumber, fingerprint, eventType, alertCode, level, data, createdAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            crypto.randomUUID(),
+            machineNumber,
+            String(alert.fingerprint || alertFingerprint(alert)).slice(0, 512),
+            event.type,
+            String(alert.code || '').slice(0, 64),
+            String(alert.level || '').slice(0, 32),
+            JSON.stringify(alert),
+            new Date().toISOString(),
+          ],
+        );
+      } catch (error) {
+        // 事件审计不能影响心跳主链路；表升级期间也保持向后兼容。
+        console.warn('[EDGE] 告警事件审计写入失败:', error.message);
+      }
+    }
   }
 
   // 依据库存 equipmentType（缺失时按 SN 前缀 WH=灵巧手，其余=手套）归类
@@ -239,8 +325,21 @@ module.exports = function createEdgeHandlers(deps) {
   }
   async function reconcile(machineNumber, devices, collector) {
     const alerts = [];
-    const gloves = (devices && devices.gloves) || {};
-    const dexHands = (devices && devices.dexterousHands) || {};
+    const gloves = { ...((devices && devices.gloves) || {}) };
+    const dexHands = { ...((devices && devices.dexterousHands) || {}) };
+    // Wuji SDK 是设备连接的权威来源；网络 Ping 不通并不等于设备未连接。
+    // Agent 上报的 SDK 结果只要带有 connected/healthy，就覆盖旧探测结果。
+    const wuji = collector && collector.wuji && typeof collector.wuji === 'object' ? collector.wuji : {};
+    for (const hand of ['left', 'right']) {
+      const sdkGlove = wuji.gloves && wuji.gloves[hand];
+      const sdkHand = wuji.dexterousHands && wuji.dexterousHands[hand];
+      if (sdkGlove && (sdkGlove.connected === true || sdkGlove.healthy === true)) {
+        gloves[hand] = { ...(gloves[hand] || {}), ...sdkGlove, connected: true, snCode: sdkGlove.sn || gloves[hand]?.snCode || null };
+      }
+      if (sdkHand && (sdkHand.connected === true || Number(sdkHand.onlineJoints || 0) > 0)) {
+        dexHands[hand] = { ...(dexHands[hand] || {}), ...sdkHand, connected: true, snCode: sdkHand.sn || dexHands[hand]?.snCode || null };
+      }
+    }
     const observed = {
       left: {
         connected: !!(gloves.left && gloves.left.connected),
@@ -319,22 +418,71 @@ module.exports = function createEdgeHandlers(deps) {
     if (collector && hasOwn(collector, 'importer') && collector.importer) {
       const importer = collector.importer;
       if (importer.reachable === false || (importer.endpointStatus && importer.endpointStatus.machine === false)) {
-        alerts.push({ level: 'warn', code: 'importer_unreachable', message: `Importer API 不可达${importer.error ? `：${importer.error}` : ''}` });
+        alerts.push({
+          level: 'warn',
+          code: 'importer_unreachable',
+          message: `Importer API 不可达${importer.error ? `：${importer.error}` : ''}`,
+          details: {
+            error: importer.error || null,
+            endpointStatus: importer.endpointStatus || null,
+            endpointErrors: importer.endpointErrors || null,
+            checkedAt: importer.checkedAt || null,
+          },
+        });
       }
     }
     if (collector && hasOwn(collector, 'hermes') && collector.hermes) {
       const hermes = collector.hermes;
       const importer = collector.importer || {};
+      const roleStatus = collector.containerRoleStatus || {};
+      const hasRoleSnapshot = Object.keys(roleStatus).length > 0;
       const collectorInactive = importer.collectorAlive === false
         || importer.is_collector_alive === false
-        || importer.health?.is_collector_alive === false;
+        || importer.health?.is_collector_alive === false
+        || (hasRoleSnapshot && roleStatus.collector?.running !== true);
       if (hermes.reachable === false && !collectorInactive) {
-        alerts.push({ level: 'error', code: 'hermes_unreachable', message: `Hermes API 不可达${hermes.error ? `：${hermes.error}` : ''}` });
+        alerts.push({
+          level: 'error',
+          code: 'hermes_unreachable',
+          message: `Hermes API 不可达${hermes.error ? `：${hermes.error}` : ''}`,
+          details: {
+            error: hermes.error || null,
+            endpointStatus: hermes.endpointStatus || null,
+            endpointErrors: hermes.endpointErrors || null,
+            checkedAt: hermes.checkedAt || null,
+          },
+        });
       }
       const health = hermes.health || {};
-      const degraded = Array.isArray(health.degraded) ? health.degraded : [];
+      const wuji = collector.importer?.wuji || collector.wuji || {};
+      const sdkGloves = wuji.gloves || {};
+      const taskState = String(importer.task && importer.task.state || '').toLowerCase();
+      const captureActive = !!(hermes.state && hermes.state.isRecording)
+        || ['active', 'running', 'in_progress', 'recording'].includes(taskState);
+      const degraded = (Array.isArray(health.degraded) ? health.degraded : []).filter(component => {
+        // Wuji 手套连接由 Wuji SDK 单独判定；Hermes 的 gello/wuji_glove
+        // degraded 常是容器初始化残留，不能作为机器异常依据。
+        if (component === 'gello/wuji_glove_l' || component === 'gello/wuji_glove_r') return false;
+        if (component === 'gello/wuji_glove_l' && (sdkGloves.left?.connected === true || sdkGloves.left?.healthy === true)) return false;
+        if (component === 'gello/wuji_glove_r' && (sdkGloves.right?.connected === true || sdkGloves.right?.healthy === true)) return false;
+        // These are advisory calibration conditions. They do not mean the
+        // collector or its device stream is disconnected.
+        if (component === 'calibration/camera_pairing') return false;
+        // 手套帧管道只会在任务采集期间产出；待机时没有帧属于预期状态。
+        if (!captureActive && component === 'pipeline/glove_frames') return false;
+        return true;
+      });
       const healthFresh = !hermes.endpointStatus || hermes.endpointStatus.health !== false;
-      if (hermes.reachable !== false && healthFresh && (degraded.length || health.allConnected === false)) {
+      // all_connected=false 可能仅由手套校准状态触发；手套连接/数据流由 Wuji SDK
+      // 单独确认，不能因为 calibration_mismatch 把整台机器标成异常。只有存在
+      // 非手套降级部件，或明确的非手套组件故障时，才生成 collector_degraded。
+      const nonGloveFault = Object.entries(health.components || {}).some(([name, item]) => {
+        if (name === 'calibration/camera_pairing') return false;
+        if (/gello\/wuji_glove_[lr]/i.test(name)) return false;
+        if (!captureActive && name === 'pipeline/glove_frames') return false;
+        return item && ['faulty', 'disconnected', 'degraded', 'error'].includes(String(item.status || '').toLowerCase());
+      });
+      if (!collectorInactive && hermes.reachable !== false && healthFresh && (degraded.length || (health.allConnected === false && nonGloveFault))) {
         // 组件降级 → 友好中文描述（gello/ 前缀才是左右手套在 Hermes health 中的实际 key）
         const DEVICE_NAMES = {
           'robot/wuji_glove_l': '设备手套L', 'robot/wuji_glove_r': '设备手套R',
@@ -358,18 +506,53 @@ module.exports = function createEdgeHandlers(deps) {
           if (name && !mapped.includes(name)) mapped.push(name);
         }
         const desc = mapped.length ? `${mapped.join('、')}连接断开` : '采集组件降级';
-        alerts.push({ level: 'error', code: 'collector_degraded', components: degraded, message: desc });
+        const cameraStats = ((collector.cameraFps && collector.cameraFps.cameras) || [])
+          .filter(camera => camera && (camera.isDropping || camera.status === 'error' || camera.status === 'dropping'))
+          .map(camera => ({
+            id: camera.cameraId || null,
+            name: camera.name || camera.device || 'camera',
+            fps: Number.isFinite(Number(camera.currentFPS)) ? Number(camera.currentFPS) : null,
+            expectedFps: Number.isFinite(Number(camera.maxFPS)) ? Number(camera.maxFPS) : null,
+            status: camera.status || null,
+          }));
+        alerts.push({
+          level: 'error',
+          code: 'collector_degraded',
+          components: degraded,
+          message: desc,
+          details: {
+            components: degraded,
+            affectedComponents: mapped,
+            cameras: cameraStats,
+            collectorAlive: importer.collectorAlive ?? null,
+            healthCheckedAt: hermes.checkedAt || null,
+          },
+        });
       }
       const state = hermes.state || {};
       const stateFresh = !hermes.endpointStatus || hermes.endpointStatus.state !== false;
-      if (hermes.reachable !== false && stateFresh && state.emergencyStopped === true) {
+      if (!collectorInactive && hermes.reachable !== false && stateFresh && state.emergencyStopped === true) {
         alerts.push({ level: 'error', code: 'emergency_stopped', message: '采集机处于急停状态，请现场确认' });
       }
-      if (hermes.reachable !== false && stateFresh && state.healthSummary && state.healthSummary.recorder && state.healthSummary.recorder !== 'ready') {
+      if (!collectorInactive && hermes.reachable !== false && stateFresh && state.healthSummary && state.healthSummary.recorder && state.healthSummary.recorder !== 'ready') {
         alerts.push({ level: 'warn', code: 'recorder_not_ready', message: `录制器状态为 ${state.healthSummary.recorder}` });
       }
-      if (hermes.reachable !== false && stateFresh && ((Number(state.errorCount) || 0) > 0 || (Array.isArray(state.errors) && state.errors.length > 0))) {
-        alerts.push({ level: 'error', code: 'hermes_errors', message: `Hermes 当前有 ${Number(state.errorCount) || state.errors.length} 个错误` });
+      if (!collectorInactive && hermes.reachable !== false && stateFresh && ((Number(state.errorCount) || 0) > 0 || (Array.isArray(state.errors) && state.errors.length > 0))) {
+        const errors = (Array.isArray(state.errors) && state.errors.length ? state.errors : (health.errors || []))
+          .slice(0, 10)
+          .map(error => typeof error === 'string' ? { message: error } : error);
+        alerts.push({
+          level: 'error',
+          code: 'hermes_errors',
+          message: `Hermes 当前有 ${Number(state.errorCount) || errors.length} 个错误`,
+          details: {
+            errorCount: Number(state.errorCount) || errors.length,
+            errors,
+            controlState: state.controlState || null,
+            isRecording: !!state.isRecording,
+            checkedAt: hermes.checkedAt || null,
+          },
+        });
       }
     }
 
@@ -508,8 +691,10 @@ module.exports = function createEdgeHandlers(deps) {
       }
 
       const alertContext = {
-        firstDetected: new Date().toISOString(),
-        occurrenceCount: 1,
+        firstDetected: a.firstDetectedAt || new Date().toISOString(),
+        lastDetected: a.lastDetectedAt || new Date().toISOString(),
+        occurrenceCount: Number(a.occurrenceCount) || 1,
+        confirmed: a.confirmed === true,
         relatedAlerts: alerts.filter(x => x.code !== a.code).map(x => `${x.code}(${x.hand || '-'})`),
       };
 
@@ -584,9 +769,13 @@ module.exports = function createEdgeHandlers(deps) {
     let prevData = {};
     try { prevData = JSON.parse((prev && prev.data) || '{}'); } catch {}
 
+    const alertLifecycle = applyAlertLifecycle(alerts, prevData.alerts, now);
+    alerts = alertLifecycle.alerts;
+
     let ticketedAlerts = {};
     try {
-      ticketedAlerts = await _autoTicket(machineNumber, alerts, prevData, b);
+      // 自动工单只由已持续确认的告警触发；急停属于立即确认的安全告警。
+      ticketedAlerts = await _autoTicket(machineNumber, alerts.filter(alert => alert.confirmed), prevData, b);
     } catch (e) {
       console.error('[EDGE] 自动工单流程异常:', e.message);
     }
@@ -610,17 +799,24 @@ module.exports = function createEdgeHandlers(deps) {
     const data = {
       observed,
       alerts,
+      alertEvents: alertLifecycle.events,
+      recoveredAlerts: alertLifecycle.events.filter(event => event.type === 'resolved').map(event => event.alert),
       ticketedAlerts,
       devices: b.devices || {},
       quest: b.quest || null,
       machineType: b.machineType || null,
+      deviceSnapshotAt: b.deviceSnapshotAt || null,
       cameraFps: b.cameraFps || null,
       // 兼容首次采样尚未产生 cameraFps 的情况；三路设备列表仍保留在机器状态。
       cameras: Array.isArray(b.cameras) ? b.cameras : [],
       encoderFps: b.encoderFps || null,
       handStream: b.handStream || null,
       wuji: b.wuji || null,
+      containers: Array.isArray(b.containers) ? b.containers : [],
+      containerRoles: b.containerRoles || {},
+      containerRoleStatus: b.containerRoleStatus || {},
       host: b.host || {},
+      performance: b.performance || null,
       importer: b.importer || null,
       hermes: b.hermes || null,
     };
@@ -652,16 +848,23 @@ module.exports = function createEdgeHandlers(deps) {
       ts: now,
       observed,
       alerts,
+      alertEvents: alertLifecycle.events,
       importer: b.importer || null,
       hermes: b.hermes || null,
+      performance: b.performance || null,
+      containers: Array.isArray(b.containers) ? b.containers : [],
+      containerRoles: b.containerRoles || {},
+      containerRoleStatus: b.containerRoleStatus || {},
     });
 
-    let prevAlertCodes = [];
-    try { prevAlertCodes = (JSON.parse((prev && prev.data) || '{}').alerts || []).map(a => a.code); } catch {}
+    await _recordAlertEvents(machineNumber, alertLifecycle.events);
+
+    let prevAlertFingerprints = [];
+    try { prevAlertFingerprints = (JSON.parse((prev && prev.data) || '{}').alerts || []).map(alert => alert.fingerprint || alertFingerprint(alert)); } catch {}
     const becameOnline = !prev || prev.status !== 'online';
-    const alertsChanged = JSON.stringify(prevAlertCodes.sort()) !== JSON.stringify(alerts.map(a => a.code).sort());
-    if (becameOnline || alertsChanged) {
-      try { broadcastSSE('machine_presence_updated', { machineNumber }); } catch {}
+    const alertsChanged = JSON.stringify(prevAlertFingerprints.sort()) !== JSON.stringify(alerts.map(alert => alert.fingerprint).sort());
+    if (becameOnline || alertsChanged || alertLifecycle.events.some(event => event.type === 'confirmed' || event.type === 'resolved')) {
+      try { broadcastSSE('machine_presence_updated', { machineNumber, alertEvents: alertLifecycle.events }); } catch {}
     }
 
     sendJSON(res, { success: true, machineNumber, serverTime: now, observed, alerts });
@@ -748,12 +951,17 @@ module.exports = function createEdgeHandlers(deps) {
           edgeAlerts: Array.isArray(d.alerts) ? d.alerts : [],
           edgeQuest: d.quest || null,
           edgeDevices: d.devices || null,
+          edgeDeviceSnapshotAt: d.deviceSnapshotAt || null,
           machineType: d.machineType || null,
           edgeCameraFps: d.cameraFps || null,
           edgeCameras: Array.isArray(d.cameras) ? d.cameras : [],
           edgeEncoderFps: d.encoderFps || null,
           edgeHandStream: d.handStream || null,
           edgeWuji: d.wuji || null,
+          edgeContainers: Array.isArray(d.containers) ? d.containers : [],
+          edgeContainerRoles: d.containerRoles || {},
+          edgeContainerRoleStatus: d.containerRoleStatus || {},
+          performance: d.performance || null,
           importer: d.importer || null,
           hermes: d.hermes || null,
         };
@@ -796,4 +1004,8 @@ module.exports = function createEdgeHandlers(deps) {
     setTicketCreator,
     setTicketCompleter,
   };
-};
+}
+
+module.exports = createEdgeHandlers;
+module.exports.alertFingerprint = alertFingerprint;
+module.exports.applyAlertLifecycle = applyAlertLifecycle;

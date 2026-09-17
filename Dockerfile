@@ -20,6 +20,10 @@ COPY src/ ./src/
 COPY index.html operations.html mobile.html mobile-ops.html ./
 COPY css/ ./css/
 COPY js/ ./js/
+# Published Vite bundles required by the desktop and operations pages.
+COPY assets/ ./assets/
+COPY icons/ ./icons/
+COPY manifest.json sw.js ./
 COPY ecosystem.config.js ./
 
 # Create data and uploads directories

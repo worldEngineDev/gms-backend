@@ -221,25 +221,24 @@ class DeviceStatusDetector {
   }
 
   async checkRoboticArm() {
-    const result = await this.checkTCPConnection(
+    // 机械臂的 IP 可达与控制端口可用是两个独立状态。此前只检查 TCP
+    // 端口，端口拒绝会被错误显示成「机械臂未连接」。
+    const network = await this.checkPingConnection(this.devices.robotic_arm.ip);
+    const control = await this.checkTCPConnection(
       this.devices.robotic_arm.ip,
       this.devices.robotic_arm.port
     );
-
-    if (!result.connected) {
-      return {
-        connected: false,
-        ip: this.devices.robotic_arm.ip,
-        port: this.devices.robotic_arm.port,
-        error: result.error,
-      };
-    }
-
     return {
-      connected: true,
+      // connected 保持为硬件网络可达，供旧版消费端安全降级。
+      connected: !!network.connected,
+      networkConnected: !!network.connected,
+      controlConnected: !!control.connected,
       ip: this.devices.robotic_arm.ip,
       port: this.devices.robotic_arm.port,
-      latency: result.latency,
+      latency: network.latency || null,
+      controlLatency: control.latency || null,
+      networkError: network.connected ? null : network.error || 'no_response',
+      controlError: control.connected ? null : control.error || 'unavailable',
     };
   }
 
@@ -365,9 +364,12 @@ class DeviceStatusDetector {
 
     const summary = {
       machineType: this.lastStatus.machineType,
+      // 轻量网络探测的时间。前端用它判断设备状态是否仍然新鲜，
+      // 不把上一轮成功结果误当成当前实时状态。
+      checkedAt: this.lastStatus.timestamp,
       gloves: {
-        left: this.lastStatus.gloves.left.connected,
-        right: this.lastStatus.gloves.right.connected,
+        left: { connected: !!this.lastStatus.gloves.left.connected, checkedAt: this.lastStatus.timestamp },
+        right: { connected: !!this.lastStatus.gloves.right.connected, checkedAt: this.lastStatus.timestamp },
       },
       quest: {
         connected: this.lastStatus.quest?.connected || false,
@@ -387,14 +389,23 @@ class DeviceStatusDetector {
 
     if (this.lastStatus.dexterousHands && this.lastStatus.dexterousHands.left && this.lastStatus.dexterousHands.right) {
       summary.dexterousHands = {
-        left: this.lastStatus.dexterousHands.left.connected,
-        right: this.lastStatus.dexterousHands.right.connected,
+        left: { connected: !!this.lastStatus.dexterousHands.left.connected, checkedAt: this.lastStatus.timestamp },
+        right: { connected: !!this.lastStatus.dexterousHands.right.connected, checkedAt: this.lastStatus.timestamp },
       };
     }
 
     if (this.lastStatus.machineType === 'dexterous') {
       summary.roboticArm = {
         connected: this.lastStatus.roboticArm?.connected || false,
+        networkConnected: this.lastStatus.roboticArm?.networkConnected || false,
+        controlConnected: this.lastStatus.roboticArm?.controlConnected || false,
+        ip: this.lastStatus.roboticArm?.ip || this.devices.robotic_arm.ip,
+        port: this.lastStatus.roboticArm?.port || this.devices.robotic_arm.port,
+        latency: this.lastStatus.roboticArm?.latency || null,
+        controlLatency: this.lastStatus.roboticArm?.controlLatency || null,
+        networkError: this.lastStatus.roboticArm?.networkError || null,
+        controlError: this.lastStatus.roboticArm?.controlError || null,
+        checkedAt: this.lastStatus.timestamp,
       };
     }
 
